@@ -1,0 +1,79 @@
+&i2c1 {
+	status = "okay";
+};
+
+&dcphy1_dw9714 {
+	status = "disabled";
+};
+
+&dcphy1_ov5647 {
+	status = "disabled";
+};
+
+&dcphy1_ov5648 {
+	status = "disabled";
+};
+
+&dcphy1_ov8858 {
+	status = "disabled";
+};
+
+&dcphy1_ov13850 {
+	status = "disabled";
+};
+
+&dcphy1_imx415 {
+	status = "okay";
+};
+
+&dcphy1_gc08a8 {
+	status = "disabled";
+};
+
+&dcphy1_gc2053 {
+	status = "disabled";
+};
+
+&dcphy1_gc4653 {
+	status = "disabled";
+};
+
+&csi2_dcphy1 {
+	status = "okay";
+};
+
+&mipi1_csi2 {
+	status = "okay";
+};
+
+&mipi_dcphy1 {
+	status = "okay";
+};
+
+&rkcif {
+	status = "okay";
+};
+
+&rkcif_mipi_lvds1 {
+	status = "okay";
+};
+
+&rkcif_mipi_lvds1_sditf {
+	status = "okay";
+};
+
+&rkcif_mmu {
+	status = "okay";
+};
+
+&rkisp1 {
+	status = "okay";
+};
+
+&isp1_mmu {
+	status = "okay";
+};
+
+&rkisp1_vir0 {
+	status = "okay";
+};
