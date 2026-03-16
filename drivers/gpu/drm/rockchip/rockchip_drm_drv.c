@@ -1294,50 +1294,139 @@ static int rockchip_drm_create_properties(struct drm_device *dev)
 	struct drm_property *prop;
 	struct rockchip_drm_private *private = dev->dev_private;
 
+	/*
+		EOTF 属性
+		创建接口：drm_property_create_range，取值范围 0~5
+		权限：原子可写（DRM_MODE_PROP_ATOMIC）
+		全称：Electro-Optical Transfer Function（电光转换函数）
+		核心作用：控制显示链路的光电转换曲线，匹配片源的 HDR/SDR 格式，是 HDR 显示的核心参数。
+		取值对应标准：覆盖主流的 HDR/SDR 格式，例如 0=传统伽马(SDR)、1=BT.1886、2=SMPTE ST 2084(HDR10)、3=HLG 等。
+		典型场景：播放 HDR 视频时，用户空间通过原子提交设置对应 EOTF，驱动配置 VOP/HDMI 输出匹配的 HDR 信号，适配显示设备。
+	*/
 	prop = drm_property_create_range(dev, DRM_MODE_PROP_ATOMIC,
 					 "EOTF", 0, 5);
 	if (!prop)
 		return -ENOMEM;
 	private->eotf_prop = prop;
-
+	
+	/*
+		COLOR_SPACE 属性
+		创建接口：drm_property_create_range，取值范围 0~12
+		权限：原子可写（DRM_MODE_PROP_ATOMIC）
+		核心作用：设置显示链路的色彩空间 / 色域标准，匹配片源和显示设备的色域，避免色偏。
+		取值对应标准：覆盖全量主流色域，例如 BT.601（标清）、BT.709（高清SDR）、BT.2020（超高清HDR）、DCI-P3（电影广色域） 等。
+		典型场景：播放广色域电影、专业校色场景，设置对应色彩空间，驱动配置 VOP 硬件色彩转换模块，保证色彩还原准确。
+	*/
 	prop = drm_property_create_range(dev, DRM_MODE_PROP_ATOMIC,
 					 "COLOR_SPACE", 0, 12);
 	if (!prop)
 		return -ENOMEM;
 	private->color_space_prop = prop;
 
+	/*
+		创建接口：drm_property_create_range，取值范围 0~1（布尔型）
+		权限：原子可写（DRM_MODE_PROP_ATOMIC）
+		核心作用：控制 DRM 原子提交的执行模式，是嵌入式场景优化显示流畅度的关键参数。
+		取值含义：0=同步提交（默认，等待硬件配置完成再返回，安全但延迟高）；1=异步提交（提交后立即返回，内核后台完成硬件配置，降低渲染延迟）。
+		典型场景：Android UI、嵌入式交互界面，异步提交可降低画面渲染延迟，避免 vsync 等待导致的卡顿、掉帧。
+		补充：Rockchip 驱动仅支持平面地址更新等轻量操作的异步提交，分辨率 / 刷新率切换等重配置只能用同步模式。
+	*/
 	prop = drm_property_create_range(dev, DRM_MODE_PROP_ATOMIC,
 					 "ASYNC_COMMIT", 0, 1);
 	if (!prop)
 		return -ENOMEM;
 	private->async_commit_prop = prop;
 
+	/*
+		SHARE_ID 属性
+		创建接口：drm_property_create_range，取值范围 0~UINT_MAX
+		权限：原子可写（DRM_MODE_PROP_ATOMIC）
+		核心作用：Rockchip 平台特有的资源共享标识，用于多进程、多 CRTC、GPU 与显示模块之间的 DMA-BUF / 帧缓冲共享，避免内存重复映射。
+		典型场景：双屏异显、多 VOP 联动、GPU 渲染与显示输出的零拷贝 buffer 共享。
+	*/
 	prop = drm_property_create_range(dev, DRM_MODE_PROP_ATOMIC,
 					 "SHARE_ID", 0, UINT_MAX);
 	if (!prop)
 		return -ENOMEM;
 	private->share_id_prop = prop;
 
+	/*
+		CONNECTOR_ID 属性
+		创建接口：drm_property_create_range，取值范围 0~0xf（4bit，最多支持 16 个显示接口）
+		权限：原子只读（DRM_MODE_PROP_ATOMIC | DRM_MODE_PROP_IMMUTABLE）
+		核心作用：给每个物理显示接口（HDMI、MIPI、DP、LVDS 等）分配唯一的硬件 ID，用户空间可通过该 ID 精准识别对应的物理接口。
+		典型场景：双 HDMI、HDMI+MIPI 等多接口设备，用户空间通过 ID 区分不同显示接口，实现针对性的显示策略。
+	*/
 	prop = drm_property_create_range(dev, DRM_MODE_PROP_ATOMIC | DRM_MODE_PROP_IMMUTABLE,
 					 "CONNECTOR_ID", 0, 0xf);
 	if (!prop)
 		return -ENOMEM;
 	private->connector_id_prop = prop;
 
+	/*
+		SOC_ID 属性
+		创建接口：drm_property_create_object，绑定对象类型 DRM_MODE_OBJECT_CRTC
+		权限：原子只读（DRM_MODE_PROP_ATOMIC | DRM_MODE_PROP_IMMUTABLE）
+		核心作用：标识当前 CRTC 对应的 SoC 型号，Rockchip 全系列 SoC 共用一套 DRM 驱动，通过该 ID 给用户空间暴露芯片型号，适配不同硬件的能力差异。
+		典型场景：通用固件 / 系统，用户空间通过该 ID 识别是 RK3588/RK3568/RK3399 等芯片，加载对应配置、适配对应的显示能力（如 8K/4K 支持）。
+	*/
 	prop = drm_property_create_object(dev,
 					  DRM_MODE_PROP_ATOMIC | DRM_MODE_PROP_IMMUTABLE,
 					  "SOC_ID", DRM_MODE_OBJECT_CRTC);
 	private->soc_id_prop = prop;
 
+	/*
+		PORT_ID 属性
+		创建接口：drm_property_create_object，绑定对象类型 DRM_MODE_OBJECT_CRTC
+		权限：原子只读（DRM_MODE_PROP_ATOMIC | DRM_MODE_PROP_IMMUTABLE）
+		核心作用：标识 CRTC 对应的硬件视频输出端口 ID，RK3588 这类多 VOP / 多 CRTC 芯片，每个 CRTC 对应一个独立硬件端口，通过该 ID 区分。
+		典型场景：RK3588 支持 3 屏异显，用户空间通过 PORT_ID 识别每个 CRTC 对应的硬件端口，匹配端口的能力上限（如部分端口支持 8K，部分仅支持 4K）。
+	*/
 	prop = drm_property_create_object(dev,
 					  DRM_MODE_PROP_ATOMIC | DRM_MODE_PROP_IMMUTABLE,
 					  "PORT_ID", DRM_MODE_OBJECT_CRTC);
 	private->port_id_prop = prop;
-
+	
+	/*
+		ACLK 属性
+		创建接口：drm_property_create_range，取值范围 0~UINT_MAX
+		权限：普通可读写
+		核心作用：设置 / 读取 VOP 的 AXI 总线时钟（ACLK）频率，ACLK 是 VOP 访问内存的核心总线时钟，直接决定显示带宽上限。
+		典型场景：8K/4K@120Hz 等高分辨率场景，提升 ACLK 频率满足带宽需求；调试时排查带宽不足导致的花屏、卡顿、画面撕裂问题。
+	*/
 	private->aclk_prop = drm_property_create_range(dev, 0, "ACLK", 0, UINT_MAX);
+	/*
+		BACKGROUND 属性
+		创建接口：drm_property_create_range，取值范围 0~UINT_MAX
+		权限：普通可读写
+		核心作用：设置 VOP 硬件背景层的颜色值，当所有图层都无内容 / 关闭时，VOP 输出该背景色。
+		取值格式：ARGB8888 颜色值，0 为全黑，UINT_MAX 为全白。
+		典型场景：系统启动、界面切换时设置默认黑底，避免出现花屏；调试时验证背景层硬件是否正常工作。
+	*/
 	private->bg_prop = drm_property_create_range(dev, 0, "BACKGROUND", 0, UINT_MAX);
+	/*
+		LINE_FLAG1 属性
+		创建接口：drm_property_create_range，取值范围 0~UINT_MAX
+		权限：普通可读写
+		核心作用：Rockchip 特有的行中断配置属性，设置 VOP 行中断的触发位置，用于 TE 同步、帧率统计、垂直消隐期的精准时序控制。
+		典型场景：VRR 可变刷新率、画面合成精准时序控制、调试显示撕裂 / 不同步问题。
+	*/
 	private->line_flag_prop = drm_property_create_range(dev, 0, "LINE_FLAG1", 0, UINT_MAX);
+	/*
+		CUBIC_LUT 属性
+		创建接口：drm_property_create，类型 DRM_MODE_PROP_BLOB
+		权限：普通可读写
+		核心作用：传递三维查找表（3D LUT）的二进制数据，实现硬件级的色彩校正、色域映射、HDR→SDR 色调映射、伽马校准。
+		典型场景：专业显示设备校色、广色域内容适配、电影级画质调色，用户空间生成校色后的 3D LUT 表，通过该属性传给内核并配置到 VOP 硬件。
+	*/
 	private->cubic_lut_prop = drm_property_create(dev, DRM_MODE_PROP_BLOB, "CUBIC_LUT", 0);
+	/*
+		CUBIC_LUT_SIZE 属性
+		创建接口：drm_property_create_range，取值范围 0~UINT_MAX
+		权限：只读（DRM_MODE_PROP_IMMUTABLE）
+		核心作用：标识硬件支持的 3D LUT 表最大尺寸（如 17x17x17、33x33x33），用户空间通过该值生成匹配尺寸的 LUT 数据，避免硬件不兼容。
+		典型场景：校色工具、显示服务读取该值，生成对应规格的 3D LUT 校准数据。
+	*/
 	private->cubic_lut_size_prop = drm_property_create_range(dev, DRM_MODE_PROP_IMMUTABLE,
 								 "CUBIC_LUT_SIZE", 0, UINT_MAX);
 
@@ -1498,6 +1587,7 @@ static int rockchip_drm_bind(struct device *dev)
 		goto err_free;
 	}
 
+	// 所有mode config属性设置
 	ret = drmm_mode_config_init(drm_dev);
 	if (ret)
 		goto err_free;
@@ -1510,6 +1600,7 @@ static int rockchip_drm_bind(struct device *dev)
 		goto err_mode_config_cleanup;
 
 	rockchip_attach_connector_property(drm_dev);
+	// 通过drm_crtc_init_with_planes()注册crtc，并初始化属性，num_crtc有值
 	ret = drm_vblank_init(drm_dev, drm_dev->mode_config.num_crtc);
 	if (ret)
 		goto err_unbind_all;

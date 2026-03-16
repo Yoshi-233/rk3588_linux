@@ -3084,29 +3084,103 @@ static const struct vop2_power_domain_data rk3588_vop_mem_pg_data[] = {
  */
 static const struct vop2_win_data rk3588_vop_win_data[] = {
 	{
+	  /* 
+		窗口的名称标识，用于调试 / 日志输出，格式为{硬件模块}-win{窗口编号}：
+		- Cluster0/1/2/3：VOP2 的 Cluster 图层（叠加层）模块
+		- Esmart0/1/2/3：VOP2 的 Esmart 图层（主图层）模块
+	  */
 	  .name = "Cluster0-win0",
+	  /* 窗口对应的硬件物理 ID，关联到 VOP2 硬件模块的物理地址空间，驱动通过该 ID 定位硬件寄存器。*/
 	  .phys_id = ROCKCHIP_VOP2_CLUSTER0,
+	  /* 
+		「拼接窗口 ID」，用于多窗口拼接显示（如 8K 超分显示时，将两个窗口拼接为一个大画面）：
+		- 示例中 Cluster0-win0 的拼接窗口是 Cluster1，意味着该窗口可与 Cluster1 窗口拼接输出
+		- 无拼接需求时该字段可省略 / 置 0
+	  */
 	  .splice_win_id = ROCKCHIP_VOP2_CLUSTER1,
+	  /*
+		该窗口在对应硬件模块中的寄存器基地址偏移：
+		- 同一模块下不同窗口（如 Cluster0-win0/win1）的 base 不同（0x00/0x80），用于区分同一模块内的不同窗口寄存器
+		- Esmart 模块的 base 偏移更大（0x0/0x200/0x400/0x600），适配其更大的寄存器空间
+	  */
 	  .base = 0x00,
+	  /* 
+		该窗口支持的像素格式数组，关联到代码中预定义的格式列表：
+		- formats_for_cluster：Cluster 模块支持的格式（如 XRGB8888、YUV420_8BIT 等）
+		- formats_for_esmart：Esmart 模块支持的格式（新增 NV12/NV21 等线性 YUV 格式）
+		（格式定义基于 DRM FourCC 标准，如 DRM_FORMAT_XRGB8888）
+		formats数组的元素个数，驱动通过该值遍历支持的像素格式
+	  */
 	  .formats = formats_for_cluster,
 	  .nformats = ARRAY_SIZE(formats_for_cluster),
+	  /* 
+		像素格式的修饰符，用于描述格式的内存布局 / 压缩特性：
+		- format_modifiers_afbc：支持 ARM AFBC（帧缓冲压缩）格式，减少带宽占用
+		- format_modifiers：仅支持线性（LINEAR）布局，无压缩
+		（修饰符是 DRM 中扩展格式属性的核心机制，如 AFBC、TILED 等）
+	  */
 	  .format_modifiers = format_modifiers_afbc,
+	  /* 
+		「图层选择 ID」，用于硬件层面选择该窗口绑定的图层通道：
+		- {0,0,0,0}：绑定到第 0 号图层通道
+		- {0xff,0xff,0xff,0xff}：无绑定（子窗口 / 辅助窗口）
+		- 长度为 4 的数组对应 VOP2 的 4 个图层通道，适配多通道叠加
+	  */
 	  .layer_sel_id = { 0, 0, 0, 0 },
+	  /*
+		窗口支持的旋转 / 镜像变换（基于 DRM 标准宏）：
+		- DRM_MODE_ROTATE_90/270：90/270 度旋转
+		- DRM_MODE_REFLECT_X/Y：X/Y 轴镜像
+		- Cluster 窗口支持旋转 + 镜像，Esmart 仅支持 Y 轴镜像（硬件限制）
+	  */
 	  .supported_rotations = DRM_MODE_ROTATE_90 | DRM_MODE_ROTATE_270 |
 				 DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y,
+	  /*
+		「水平向上缩放滤镜模式」：
+		 - VOP2_SCALE_UP_BIC：双线性插值（Bicubic），缩放后画质更优
+		 - 其他取值：BIL（双线性）、NEAREST（最近邻，画质差但速度快）
+		「水平向下缩放滤镜模式」：
+		 - VOP2_SCALE_DOWN_BIL：双线性插值，适配缩小画面时的抗锯齿
+		「垂直向上缩放滤镜模式」，逻辑同 hsu_filter_mode
+		「垂直向下缩放滤镜模式」，逻辑同 hsd_filter_mode
+	  */
 	  .hsu_filter_mode = VOP2_SCALE_UP_BIC,
 	  .hsd_filter_mode = VOP2_SCALE_DOWN_BIL,
 	  .vsu_filter_mode = VOP2_SCALE_UP_BIL,
 	  .vsd_filter_mode = VOP2_SCALE_DOWN_BIL,
+	  /* 指向该窗口对应的寄存器配置结构体，包含窗口的寄存器偏移、掩码、读写属性等底层硬件配置。 */
 	  .regs = &rk3568_cluster0_win_data,
+	  /* 「电源域 ID」，用于电源管理：驱动通过该 ID 控制对应硬件模块的上电 / 下电，节省功耗。 */
 	  .pd_id = VOP2_PD_CLUSTER0,
+	  /* 「AXI 总线 ID」：VOP2 通过 AXI 总线访问显存，该 ID 用于区分不同的 AXI 主设备，适配总线带宽调度。 */
 	  .axi_id = 0,
+	  /* 「Y/RGB 通道 AXI ID」：针对 YUV/RGB 格式，区分亮度 / 色度 / RGB 通道的 AXI 总线 ID，适配多通道并发访问。 */
 	  .axi_yrgb_id = 2,
+	  /* 「UV 通道 AXI ID」：YUV 格式的色度（UV）通道 AXI ID，与 axi_yrgb_id 配合实现 Y/UV 分离访问。 */
 	  .axi_uv_id = 3,
+	  /* 
+		「最大向上缩放倍数」：
+		- Cluster 窗口最大 4 倍缩放（如 1080P→4K）
+		- Esmart 窗口最大 8 倍缩放（如 720P→8K）
+		由硬件缩放单元的能力决定 
+	  */
 	  .max_upscale_factor = 4,
 	  .max_downscale_factor = 4,
+	  /*
+		「硬件延迟参数」：
+		- 长度为 3 的数组，对应 VOP2 内部不同阶段的延迟（如数据读取、处理、输出）
+		- 适配硬件流水线的时序同步，避免画面撕裂 / 错位
+	  */
 	  .dly = { 4, 26, 29 },
 	  .type = DRM_PLANE_TYPE_OVERLAY,
+	  /*
+		「窗口硬件特性标志位」：
+		- WIN_FEATURE_AFBDC：支持 AFBC 帧缓冲压缩
+		- WIN_FEATURE_CLUSTER_MAIN：Cluster 模块主窗口
+		- WIN_FEATURE_SPLICE_LEFT：拼接窗口的左侧窗口
+		- WIN_FEATURE_MULTI_AREA：支持多区域显示
+		- WIN_FEATURE_CLUSTER_SUB：Cluster 模块子窗口
+	  */
 	  .feature = WIN_FEATURE_AFBDC | WIN_FEATURE_CLUSTER_MAIN | WIN_FEATURE_SPLICE_LEFT,
 	},
 
@@ -3296,6 +3370,10 @@ static const struct vop2_win_data rk3588_vop_win_data[] = {
 	  .vsu_filter_mode = VOP2_SCALE_UP_BIL,
 	  .vsd_filter_mode = VOP2_SCALE_DOWN_BIL,
 	  .regs = &rk3568_esmart_win_data,
+	  /*
+		「多区域配置数组」，仅 Esmart 窗口支持（WIN_FEATURE_MULTI_AREA）：
+		- 用于定义窗口的多个显示区域（如分屏、多源合成），适配复杂显示场景
+	  */
 	  .area = rk3568_area_data,
 	  .area_size = ARRAY_SIZE(rk3568_area_data),
 	  .type = DRM_PLANE_TYPE_PRIMARY,
@@ -3927,40 +4005,96 @@ static const struct vop2_data rk3568_vop = {
 };
 
 static const struct vop2_data rk3588_vop = {
+	/* 标识该 VOP 实例对应的芯片版本为 RK3588，用于驱动区分不同芯片（如 RK3568/RK3528）的 VOP 硬件差异，适配不同的寄存器配置、功能集。 */
 	.version = VOP_VERSION_RK3588,
+	/* 
+		标识该 VOP 支持的核心特性：
+		- VOP_FEATURE_SPLICE：表示支持画面拼接功能（多通道 / 多图层拼接输出），是 RK3588 VOP 区别于低规格芯片的关键特性之一；
+		（其他常见 feature 如 VOP_FEATURE_ALPHA_SCALE（Alpha 缩放）、VOP_FEATURE_HDR（HDR 处理）等会在低规格芯片中定义）。
+	*/
 	.feature = VOP_FEATURE_SPLICE,
+	/*
+		该 VOP 硬件集成的 DSC 控制器数量，RK3588 包含 2 个 DSC 模块（对应代码中 rk3588_vop_dsc_data 里的 8K 和 4K DSC 实例）。
+	*/
 	.nr_dscs = 2,
+	/* DSC 错误码表（dsc_ecw）的条目数量，dsc_ecw 定义了 DSC 编码器的各类错误（如比特数错误、缓冲区溢出等），该值用于驱动遍历 / 解析错误信息。 */
 	.nr_dsc_ecw = ARRAY_SIZE(dsc_ecw),
+	/* DSC 缓冲区流错误表（dsc_buffer_flow）的条目数量，专用于解析 DSC 各类缓冲区（速率缓冲、行缓冲、像素缓冲等）的状态错误。 */
 	.nr_dsc_buffer_flow = ARRAY_SIZE(dsc_buffer_flow),
+	/* 
+		Video Port（视频端口）的数量，RK3588 支持 4 个 VP（视频输出端口），每个 VP 可独立配置输出时序、
+		图层混合等（代码中可见 rk3568_vp0_intr/rk3588_vp3_intr 对应 VP0~VP3）。 
+	*/
 	.nr_vps = 4,
+	/* 图层混合器（Mixer）的数量，混合器负责将多个图层（Layer）的像素数据混合为最终输出画面，7 个混合器对应硬件的多图层混合能力。*/
 	.nr_mixers = 7,
+	/* 可配置的图层（Layer）数量，图层是 VOP 中承载图像数据的基本单元（如 UI 层、视频层），RK3588 支持 8 个独立图层，每个图层可配置格式、缩放、透明度等。 */
 	.nr_layers = 8,
+	/* Gamma 校正模块的数量，Gamma 模块用于调整画面伽马曲线（适配不同显示设备的亮度特性），4 个 Gamma 模块可分别对应不同 VP / 输出通道。*/ 
 	.nr_gammas = 4,
 	.max_input = { 4096, 4320 },
 	.max_output = { 4096, 4320 },
+	/* 指向 VOP 核心控制配置结构体，包含 VOP 主控制器的寄存器映射、基础操作（如初始化、复位）等。 */
 	.ctrl = &rk3588_vop_ctrl,
+	/* 指向 GRF（General Register File，通用寄存器文件）配置结构体，RK3588 的 VOP 关联多个 GRF 模块（核心 GRF、系统 GRF、VO1 通道 GRF），用于芯片级的 VOP 时钟、电源、引脚配置。 */
 	.grf = &rk3588_vop_grf_ctrl,
 	.sys_grf = &rk3588_sys_grf_ctrl,
 	.vo1_grf = &rk3588_vo1_grf_ctrl,
+	/* 指向 AXI 总线中断配置结构体，VOP 与 AXI 总线交互时的中断（如总线错误、写回 FIFO 满）由该配置管理，包含中断状态 / 使能 / 清除寄存器。 */
 	.axi_intr = rk3568_vop_axi_intr,
+	/* AXI 中断配置数组的长度，驱动通过该值遍历所有 AXI 中断配置项 */
 	.nr_axi_intr = ARRAY_SIZE(rk3568_vop_axi_intr),
+	/*
+		指向 DSC 控制器的配置数组（包含 8K/4K DSC 的寄存器、时钟、最大切片数等），对应 nr_dscs=2 的两个 DSC 实例。
+		指向 DSC 错误码对照表，用于驱动解析 DSC 编码器的错误状态（如 0x0030ffff 表示 “每分量比特数错误”）
+		指向 DSC 缓冲区流错误对照表，专用于解析缓冲区相关错误（如 0x00000001 表示 “行缓冲状态错误”）。
+	*/
 	.dsc = rk3588_vop_dsc_data,
 	.dsc_error_ecw = dsc_ecw,
 	.dsc_error_buffer_flow = dsc_buffer_flow,
+	/* 指向视频端口（VP）的配置数组，包含每个 VP 的寄存器、中断、输出能力等（如 VP0/VP1/VP2/VP3 的时序、图层选择配置）*/
 	.vp = rk3588_vop_video_ports,
+	/* 
+		指向 VOP 与显示接口（如 HDMI/DP/MIPI）的连接配置，定义 VOP 各 VP 可绑定的显示接口类型、时序匹配规则。 
+		显示接口连接配置的数量，驱动遍历该数组初始化所有可用的显示接口。
+	*/
 	.conn = rk3588_conn_if_data,
 	.nr_conns = ARRAY_SIZE(rk3588_conn_if_data),
+	/* 
+		指向 WB（WriteBack，写回） 模块配置，WB 模块用于将 VOP 输出的画面写回内存（如截图、视频录制），包含支持的格式、最大输出分辨率、FIFO 深度等。
+	*/
 	.wb = &rk3568_vop_wb_data,
+	/*
+		指向图层（Layer）配置数组，定义每个图层支持的像素格式、缩放能力、寄存器映射等。
+	*/
 	.layer = rk3568_vop_layers,
+	/*
+		指向窗口（Window）配置数组，VOP 的窗口对应图层的显示区域（位置、大小），该配置定义窗口的硬件参数。
+		窗口配置数组的长度，驱动通过该值初始化所有硬件窗口。
+	*/
 	.win = rk3588_vop_win_data,
 	.win_size = ARRAY_SIZE(rk3588_vop_win_data),
+	/*
+		指向 PD（Power Domain，电源域）配置数组，RK3588 VOP 各子模块（如 DSC、VP）有独立电源域，该配置用于电源管理（如低功耗休眠）。
+		电源域配置数组的长度。
+	*/
 	.pd = rk3588_vop_pd_data,
 	.nr_pds = ARRAY_SIZE(rk3588_vop_pd_data),
+	/*
+		指向内存电源门控（Memory Power Gating）配置，用于 VOP 内存子系统的低功耗管理。
+		内存电源门控配置数组的长度。
+	*/
 	.mem_pg = rk3588_vop_mem_pg_data,
 	.nr_mem_pgs = ARRAY_SIZE(rk3588_vop_mem_pg_data),
+	/*
+		指向 VOP 寄存器转储配置数组，用于调试时导出关键寄存器的数值（如定位显示异常时，打印寄存器状态）。
+		寄存器转储数组的长度，驱动据此遍历并打印所有需要监控的寄存器。
+	*/
 	.dump_regs = rk3588_dump_regs,
 	.dump_regs_size = ARRAY_SIZE(rk3588_dump_regs),
+	/* 指向平面掩码（Plane Mask）配置，Plane 是 DRM 框架中图像数据的载体，该掩码定义 VOP 各 VP 可关联的 Plane 范围（硬件层面的图层 / 平面映射） */
 	.plane_mask = rk3588_vp_plane_mask[0],
+	/* Plane 掩码的基地址，对应硬件寄存器中 Plane 掩码的起始偏移，驱动通过基地址 + 偏移访问具体的 Plane 掩码寄存器。 */
 	.plane_mask_base = RK3588_PLANE_MASK_BASE,
 };
 
