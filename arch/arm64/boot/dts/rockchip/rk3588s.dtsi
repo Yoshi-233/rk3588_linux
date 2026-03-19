@@ -4023,6 +4023,8 @@
 			      "dclk_src_vp0",
 			      "dclk_src_vp1",
 			      "dclk_src_vp2";
+		// assigned-clocks/assigned-clock-rates：强制配置 —— 告诉内核将指定时钟强制设置为目标频率；
+		// VOP 模块依赖 10 个时钟，且将其核心时钟 ACLK_VOP 强制设置为 500MHz。
 		assigned-clocks = <&cru ACLK_VOP>;
 		assigned-clock-rates = <500000000>;
 		resets = <&cru SRST_A_VOP>,

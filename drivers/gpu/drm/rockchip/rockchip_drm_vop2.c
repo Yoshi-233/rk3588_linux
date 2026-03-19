@@ -375,9 +375,25 @@ struct vop2_plane_state {
 	struct vop_dump_list *planlist;
 };
 
+/*
+	vop2_win = 标准 DRM Plane + RK VOP2 硬件私有扩展属性，
+	在 RK 平台的 DRM 驱动中，一个 vop2_win 实例就对应一个可被用户态操作的 DRM Plane。
+*/
 struct vop2_win {
+	/* 
+		该窗口的名称字符串（如cluster0_win0、esmart0_win0），
+		用于日志打印、调试定位、DRM 属性标识，代码中大量通过该名称区分不同窗口的报错与状态信息。 
+	*/
 	const char *name;
+	/* 
+		指向该窗口所属的 VOP2 控制器主结构体，包含 VOP2 的全局寄存器基地址、时钟、中断、硬件版本、
+		电源域等核心信息，所有对 VOP2 硬件的寄存器读写都依赖该指针。
+	*/
 	struct vop2 *vop2;
+	/* 
+		指向父窗口，用于多区域（multi-area）模式：一个主窗口可拆分为多个子窗口，
+		子窗口的parent指向主窗口，共享主窗口的硬件资源，仅显示区域不同。
+	*/
 	struct vop2_win *parent;
 	struct drm_plane base;
 
@@ -386,6 +402,8 @@ struct vop2_win {
 	 *
 	 * A cluster window can split as two windows:
 	 * a main window and a sub window.
+	 * 标记该 Cluster 窗口是否工作在双窗口模式：true表示该窗口是 Cluster 拆分的 main/sub 子窗口之一，
+	 * false表示单窗口模式。驱动会根据该标志单独配置 Cluster 的 Alpha 混合硬件寄存器。
 	 */
 	bool two_win_mode;
 
@@ -400,35 +418,53 @@ struct vop2_win {
 
 	/*
 	 * @splice_mode_right: As right part of the screen in splice mode.
+	 标记该窗口是否是拼接模式下的右半部分窗口：true表示负责显示超宽画面的右半部分，
+	 需要计算帧缓冲的偏移量，跳过左半部分像素数据；false表示左半部分主窗口。
 	 */
 	bool splice_mode_right;
 
 	/**
 	 * @splice_win: splice win which used to splice for a plane
 	 * hdisplay > 4096
+	 * 指向拼接模式的配对窗口：左窗口的splice_win指向右窗口，
+	 * 右窗口的splice_win指向左窗口，原子提交时会同步配置配对窗口的硬件寄存器，保证左右画面同步。
 	 */
 	struct vop2_win *splice_win;
+	/* 
+		拼接模式下，右窗口通过该指针指向左窗口，获取左窗口的源坐标、帧缓冲信息，计算自身在帧缓冲中的像素偏移。
+	*/
 	struct vop2_win *left_win;
-
+	/* 
+		拼接配对窗口的硬件物理 ID，驱动通过该 ID 在初始化时找到对应的配对窗口实例
+	*/
 	uint8_t splice_win_id;
-
+	/* 
+		指向该窗口所属的电源域结构体，包含电源域的引用计数、VP 掩码、上下电工作队列。
+		窗口使能时增加引用计数，禁用时减少，引用计数为 0 时关闭对应电源域以降低功耗。
+	*/
 	struct vop2_power_domain *pd;
 
 	/**
 	 * @phys_id: physical id for cluster0/1, esmart0/1, smart0/1
 	 * Will be used as a identification for some register
 	 * configuration such as OVL_LAYER_SEL/OVL_PORT_SEL.
+	 * 窗口的硬件物理 ID，是 VOP2 硬件层面的唯一标识
+	 * （如ROCKCHIP_VOP2_CLUSTER0、ROCKCHIP_VOP2_ESMART0），所有寄存器配置、图层路由、VP 绑定都基于该 ID。
 	 */
 	uint8_t phys_id;
 
 	/**
 	 * @win_id: graphic window id, a cluster maybe split into two
 	 * graphics windows.
+	 * 图形窗口 ID：一个固定 phys_id 的 Cluster 硬件窗口，可拆分为多个逻辑图形窗口，
+	 * 共享同一个 phys_id，但 win_id 不同，用于区分同一硬件窗口拆分的多个逻辑窗口。
 	 */
 	uint8_t win_id;
 	/**
 	 * @area_id: multi display region id in a graphic window, they
 	 * share the same win_id.
+	 * 多区域模式的显示区域 ID：同一个 win_id 的窗口可拆分为多个显示区域，
+	 * area_id 从 0 开始递增（0 为主区域），用于区分同一逻辑窗口的不同显示分区。
 	 */
 	uint8_t area_id;
 	/**
@@ -437,53 +473,150 @@ struct vop2_win {
 	uint8_t plane_id;
 	/**
 	 * @layer_id: id of the layer which the window attached to
+	 * 该窗口绑定的硬件叠加层（Layer）ID。VOP2 的 Layer 是画面叠加流水线的核心单元，
+	 * 窗口必须绑定到 Layer 上才能参与最终的画面叠加，驱动会根据该 ID 配置窗口与 Layer 的绑定关系。
 	 */
 	uint8_t layer_id;
+	/*
+		该窗口在不同 VP 下的 Layer 选择 ID 数组。VOP2 的不同 VP（显示输出端口）
+		对同一个窗口的 Layer 路由有不同的 ID 映射，配置硬件寄存器时会根据当前归属的 VP，从该数组取对应 ID 写入。
+	*/
 	const uint8_t *layer_sel_id;
 	/**
 	 * @vp_mask: Bitmask of video_port0/1/2 this win attached to,
 	 * one win can only attach to one vp at the one time.
+	 * 该窗口当前归属的 VP（Video Port）的 bitmask，VOP2 最多支持 4 个 VP，每个 bit 对应一个 VP，
+	 * 同一时间一个窗口只能归属一个 VP。驱动通过该值配置窗口的硬件输出路由，决定画面从哪个 VP 输出到屏幕。
 	 */
 	uint8_t vp_mask;
 	/**
 	 * @old_vp_mask: Bitmask of video_port0/1/2 this win attached of last commit,
 	 * this is used for trackng the change of VOP2_PORT_SEL register.
+	 * 上一次原子提交时的 vp_mask，用于跟踪窗口的 VP 归属变化，
+	 * 处理 VP 切换时的硬件时序同步、vsync 跳过等特殊逻辑。
 	 */
 	uint8_t old_vp_mask;
+	/*
+		该 Plane 的画面叠加层级（Z 轴顺序）：zpos 值越小，画面越靠底层；值越大，画面越靠顶层。
+		DRM 框架和 VOP2 硬件都通过该值决定图层的叠加顺序和 Alpha 混合逻辑。
+	*/
 	uint8_t zpos;
+	/*
+		该窗口的私有寄存器组，在 VOP2 总寄存器空间中的基地址偏移，
+		读写窗口私有寄存器时，通过「VOP2 基地址 + offset」计算最终的寄存器物理地址。
+	*/
 	uint32_t offset;
+	/*
+		该窗口的 AXI 总线主设备 ID，VOP2 的每个窗口都有独立的 AXI 总线通道，
+		用于从内存读取帧缓冲数据，IOMMU、总线带宽配置时通过该 ID 标识对应通道。
+	*/
 	uint8_t axi_id;
+	/*
+		Y/RGB 分量的 AXI 通道 ID，YUV 格式下的 Y 分量、RGB 格式下的全量像素数据，通过该通道读取。
+	*/
 	uint8_t axi_yrgb_id;
+	/*
+		UV 分量的 AXI 通道 ID，YUV 格式下的 UV 分量通过独立的该通道读取，与 Y 分量分开传输。
+	*/
 	uint8_t axi_uv_id;
+	/*
+		该窗口绑定的缩放引擎编号，VOP3 的缩放引擎是独立硬件单元，
+		需要为每个带缩放能力的窗口分配专属缩放引擎，缩放配置时基于该编号操作对应寄存器。
+	*/
 	uint8_t scale_engine_num;
+	/*
+		DRM 标准属性，该 Plane 可绑定的 CRTC（对应 VOP2 的 VP）的 bitmask，
+		标记这个窗口能在哪些 VP 上输出，DRM 框架会校验 Plane 绑定的 CRTC 是否在该掩码范围内。
+	*/
 	uint8_t possible_crtcs;
 	enum drm_plane_type type;
+	/*
+		最大最小缩放倍数
+	*/
 	unsigned int max_upscale_factor;
 	unsigned int max_downscale_factor;
+	/*
+		该窗口支持的旋转 / 镜像能力 bitmask，包括DRM_MODE_ROTATE_0/90/180/270、DRM_MODE_REFLECT_X/Y等，
+		驱动会基于该值创建 DRM 旋转属性，并校验用户设置的旋转角度是否合法。
+	*/
 	unsigned int supported_rotations;
+	/*
+		该窗口在不同工作模式下的硬件流水线延迟周期数组。VOP2 不同窗口、不同工作模式（HDR / 非 HDR / 缩放）
+		的画面流水线延迟不同，驱动会从该数组取对应延迟值写入寄存器，保证多层画面同步输出。
+	*/
 	const uint8_t *dly;
 	/*
 	 * vertical/horizontal scale up/down filter mode
+	 水平方向放大的滤波器模式，VOP2 缩放引擎支持最近邻、双线性、双三次等不同滤波算法，用于控制水平放大的画面画质。
 	 */
 	uint8_t hsu_filter_mode;
+	/*
+		水平方向缩小的滤波器模式，控制水平缩小的画质与算法。
+	*/
 	uint8_t hsd_filter_mode;
+	/*
+		垂直方向放大的滤波器模式，控制垂直放大的画质。
+	*/
 	uint8_t vsu_filter_mode;
+	/*
+		垂直方向缩小的滤波器模式，控制垂直缩小的画质。
+	*/
 	uint8_t vsd_filter_mode;
+	/*
+		水平缩小的预滤波器模式，大比例水平缩小时开启前置滤波，减少画面摩尔纹、提升画质。
+	*/
 	uint8_t hsd_pre_filter_mode;
+	/*
+		垂直缩小的预滤波器模式，大比例垂直缩小时开启前置滤波优化。
+	*/
 	uint8_t vsd_pre_filter_mode;
-
+	/*
+		指向该窗口的寄存器定义结构体，包含该窗口所有功能寄存器的偏移、位掩码、位移等信息，是VOP_WIN_SET/VOP_WIN_GET等寄存器读写宏的核心依赖。
+	*/
 	const struct vop2_win_regs *regs;
+	/*
+		该窗口支持的 DRM 格式修饰符数组，描述像素的内存布局，
+		比如 AFBC 压缩、Tiled 块模式等，DRM 框架会校验帧缓冲的修饰符是否被该 Plane 支持
+	*/
 	const uint64_t *format_modifiers;
+	/*
+		该窗口支持的像素格式数组，是 DRM 标准的四字符格式（FOURCC），比如DRM_FORMAT_ARGB8888、DRM_FORMAT_NV12等。
+	*/
 	const uint32_t *formats;
+	/*
+		formats 数组的元素个数，即该窗口支持的像素格式总数量。
+	*/
 	uint32_t nformats;
+	/*
+		该窗口的硬件特性 bitmask，标记是否支持 AFBC 压缩、Cluster 双窗口、HDR 处理等特性，
+		驱动中通过win->feature & 特性位判断是否开启对应硬件功能
+	*/
 	uint64_t feature;
+	/*
+		暴露窗口硬件特性的 DRM 属性，用户态可读取该属性，获知 Plane 是否支持缩放、AFBC 等能力。
+	*/
 	struct drm_property *feature_prop;
+	/*
+		暴露窗口支持的最大输入分辨率的 DRM 属性，用户态可读取获知该 Plane 的输入画面尺寸上限。
+	*/
 	struct drm_property *input_width_prop;
 	struct drm_property *input_height_prop;
+	/*
+		暴露窗口支持的最大输出分辨率的 DRM 属性，用户态可读取获知该 Plane 的输出画面尺寸上限。
+	*/
 	struct drm_property *output_width_prop;
 	struct drm_property *output_height_prop;
+	/*
+		颜色键（Colorkey）DRM 属性，用户态可配置颜色键值，实现「指定颜色值的像素透明」的叠加效果，驱动会基于该属性配置硬件颜色键寄存器。
+	*/
 	struct drm_property *color_key_prop;
+	/*
+		暴露窗口支持的缩放倍数范围的 DRM 属性。
+	*/
 	struct drm_property *scale_prop;
+	/*
+		暴露窗口名称的 DRM 属性，用于用户态识别不同的 Plane。
+	*/
 	struct drm_property *name_prop;
 };
 
@@ -11304,7 +11437,7 @@ static void vop2_dsc_data_init(struct vop2 *vop2)
 static int vop2_win_init(struct vop2 *vop2)
 {
 	const struct vop2_data *vop2_data = vop2->data;
-	const struct vop2_layer_data *layer_data;
+	const struct vop2_layer_data *layer_data; // rk3588不需要关注
 	struct drm_prop_enum_list *plane_name_list;
 	struct vop2_win *win;
 	struct vop2_layer *layer;
@@ -11393,8 +11526,10 @@ static int vop2_win_init(struct vop2 *vop2)
 
 	vop2->registered_num_wins = num_wins;
 
+	/* layer类似vdu mix layer */
 	if (!is_vop3(vop2)) {
 		for (i = 0; i < vop2_data->nr_layers; i++) {
+			// 将vop2的layer数据填充,用的是vop2的vop2_data的layer
 			layer = &vop2->layers[i];
 			layer_data = &vop2_data->layer[i];
 			layer->id = layer_data->id;
@@ -11416,6 +11551,7 @@ static int vop2_win_init(struct vop2 *vop2)
 		plane_name_list[i].name = win->name;
 	}
 
+	// 传递plane名字
 	vop2->plane_name_list = plane_name_list;
 
 	return 0;
@@ -11616,17 +11752,25 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 	if (ret)
 		return ret;
 
+	/* 
+		vop: vop@fdd90000 {
+		compatible = "rockchip,rk3588-vop";
+		reg = <0x0 0xfdd90000 0x0 0x4200>, <0x0 0xfdd95000 0x0 0x1000>;
+		reg-names = "regs", "gamma_lut";
+	*/
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "regs");
 	if (!res) {
 		DRM_DEV_ERROR(vop2->dev, "failed to get vop2 register byname\n");
 		return -EINVAL;
 	}
 	vop2->res = res;
+	// 申请虚拟地址
 	vop2->regs = devm_ioremap_resource(dev, res);
 	if (IS_ERR(vop2->regs))
 		return PTR_ERR(vop2->regs);
 	vop2->len = resource_size(res);
 
+	// vop2->regsbak 是分配了一块和寄存器区域等长的内存
 	vop2->regsbak = devm_kzalloc(dev, vop2->len, GFP_KERNEL);
 	if (!vop2->regsbak)
 		return -ENOMEM;
@@ -11645,40 +11789,102 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 			return PTR_ERR(vop2->acm_regs);
 	}
 
+	/*
+		1. syscon 与 regmap 是什么？
+		syscon：是 Linux 内核中对 “系统控制寄存器块” 的抽象（兼容 syscon 的设备树节点表示一段内存映射的寄存器区域）。
+		regmap：是内核提供的寄存器访问抽象层，目的是统一不同总线（AHB/APB/MMIO 等）、不同宽度寄存器的访问方式，避免重复编写内存映射、读写逻辑。
+		2. syscon_regmap_lookup_by_phandle 的执行逻辑
+		这个函数的核心行为是：
+		步骤 1：通过传入的 phandle（如 "rockchip,grf"）找到设备树中对应的节点（如 sys_grf: syscon@fd58c000）。
+		步骤 2：读取该节点的 reg 属性（如 <0x0 0xfd58c000 0x0 0x1000>），但不会立即映射物理地址。
+		步骤 3：查找该 syscon 节点对应的 regmap 实例（如果该节点已被 syscon 框架初始化，会提前创建 regmap；若未初始化，可能返回错误）。
+		步骤 4：返回 regmap 句柄（如 vop2->sys_grf 保存的是 regmap 指针），而非直接的物理地址映射。
+		3. 物理地址的映射时机
+		物理地址的实际映射（ioremap）发生在 syscon 节点的初始化阶段（而非 lookup 阶段）：
+		内核启动时，syscon 驱动（drivers/mfd/syscon.c）会遍历设备树中所有 compatible = "syscon" 的节点。
+		对每个节点，syscon 驱动会读取 reg 属性中的物理地址 / 长度，调用 ioremap 将物理地址（如 0xfd58c000）映射为内核虚拟地址。
+		基于映射后的虚拟地址创建 regmap 实例，并将 regmap 与 syscon 节点关联起来。
+		4. 代码中后续如何访问寄存器？
+		拿到 regmap 句柄后，你需要通过 regmap 提供的 API 访问寄存器（而非直接操作地址），例如：
+	*/
+
+	/*
+		sys_grf: syscon@fd58c000 {
+		compatible = "rockchip,rk3588-sys-grf", "syscon", "simple-mfd";
+		reg = <0x0 0xfd58c000 0x0 0x1000>;
+	*/
 	vop2->sys_grf = syscon_regmap_lookup_by_phandle(dev->of_node, "rockchip,grf");
+	/*
+		vop_grf: syscon@fd5a4000 {
+			compatible = "rockchip,rk3588-vop-grf", "syscon";
+			reg = <0x0 0xfd5a4000 0x0 0x2000>;
+		}; 
+	 */
 	vop2->grf = syscon_regmap_lookup_by_phandle(dev->of_node, "rockchip,vop-grf");
+	/*
+		vo1_grf: syscon@fd5a8000 {
+			compatible = "rockchip,rk3588-vo-grf", "syscon";
+			reg = <0x0 0xfd5a8000 0x0 0x100>;
+			clocks = <&pclk_vo1_grf>;
+		};
+	*/
 	vop2->vo1_grf = syscon_regmap_lookup_by_phandle(dev->of_node, "rockchip,vo1-grf");
+	/*
+		pmu: power-management@fd8d8000 {
+		compatible = "rockchip,rk3588-pmu", "syscon", "simple-mfd";
+		reg = <0x0 0xfd8d8000 0x0 0x400>;
+	*/
 	vop2->sys_pmu = syscon_regmap_lookup_by_phandle(dev->of_node, "rockchip,pmu");
 
+	/* 
+		全称：Advanced High-performance Bus Clock（高级高性能总线时钟）。
+		作用：驱动 VOP2 与 AHB 总线之间的交互逻辑，负责低速控制信号、寄存器配置、状态查询等功能（比如读写 VOP2 的控制寄存器、中断状态寄存器）。
+		特点：频率相对较低，侧重 “控制” 而非 “数据传输”，是 VOP2 最基础的时钟（必须获取，否则模块无法配置）。
+	*/
 	vop2->hclk = devm_clk_get(vop2->dev, "hclk_vop");
 	if (IS_ERR(vop2->hclk)) {
 		DRM_DEV_ERROR(vop2->dev, "failed to get hclk source\n");
 		return PTR_ERR(vop2->hclk);
 	}
+	
+	/*
+		全称：Advanced eXtensible Interface Clock（高级可扩展接口时钟）。
+		作用：驱动 VOP2 与 AXI 总线之间的高速数据传输逻辑，负责视频帧数据的读写（比如从 DDR 读取视频帧缓冲区数据、向显示接口发送像素数据）。
+		特点：频率远高于 HCLK，是 VOP2 处理视频数据的核心时钟（必须获取，否则无数据输出）。
+	*/
 	vop2->aclk = devm_clk_get(vop2->dev, "aclk_vop");
 	if (IS_ERR(vop2->aclk)) {
 		DRM_DEV_ERROR(vop2->dev, "failed to get aclk source\n");
 		return PTR_ERR(vop2->aclk);
 	}
 
+	/*
+		全称：像素时钟（或外设专用时钟）。
+		作用：
+		若为 “像素时钟”：直接驱动显示时序（如 LCD/HDMI 的像素输出节奏，决定分辨率和刷新率，比如 1080p@60Hz 对应～148.5MHz 像素时钟）；
+		若为 “外设时钟”：驱动 VOP2 外接的外设接口（如 I2C 控制 HDMI 芯片、GPIO 控制背光）。
+		特点：devm_clk_get_optional 表示 “可选”—— 不同芯片 / 板卡的 VOP2 设计中，若像素时钟由其他模块（如 HDMI TX）提供，则 VOP2 无需单独获取，因此标记为可选（获取失败不直接报错，但需后续判断）。
+	*/
 	vop2->pclk = devm_clk_get_optional(vop2->dev, "pclk_vop");
 	if (IS_ERR(vop2->pclk)) {
 		DRM_DEV_ERROR(vop2->dev, "failed to get pclk source\n");
 		return PTR_ERR(vop2->pclk);
 	}
 
+	// 复位 VOP2 的 AHB 控制域逻辑
 	vop2->ahb_rst = devm_reset_control_get_optional(vop2->dev, "ahb");
 	if (IS_ERR(vop2->ahb_rst)) {
 		DRM_DEV_ERROR(vop2->dev, "failed to get ahb reset\n");
 		return PTR_ERR(vop2->ahb_rst);
 	}
-
+	// 获取 AXI 复位控制器句柄（optional 表示可选，若节点无此属性不会直接报错）
 	vop2->axi_rst = devm_reset_control_get_optional(vop2->dev, "axi");
 	if (IS_ERR(vop2->axi_rst)) {
 		DRM_DEV_ERROR(vop2->dev, "failed to get axi reset\n");
 		return PTR_ERR(vop2->axi_rst);
 	}
 
+	// 获取 VOP2 的中断号
 	vop2->irq = platform_get_irq(pdev, 0);
 	if (vop2->irq < 0) {
 		DRM_DEV_ERROR(dev, "cannot find irq for vop2\n");
@@ -11699,6 +11905,7 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 			of_property_read_u32(child, "rockchip,primary-plane", &primary_plane_phy_id);
 			of_property_read_u32(child, "reg", &vp_id);
 
+			// 这里设备树没写
 			vop2->vps[vp_id].plane_mask = plane_mask;
 			if (plane_mask)
 				vop2->vps[vp_id].primary_plane_phy_id = primary_plane_phy_id;
@@ -11707,6 +11914,10 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 
 			vop2->vps[vp_id].xmirror_en = of_property_read_bool(child, "xmirror-enable");
 
+			/*
+				函数的设计逻辑就是：没有时钟分配属性，就什么都不做，直接返回成功；
+				只有节点带了assigned-clocks属性，但时钟解析 / 设置失败时，才会返回负数错误码。
+			*/
 			ret = of_clk_set_defaults(child, false);
 			if (ret) {
 				DRM_DEV_ERROR(dev, "Failed to set clock defaults %d\n", ret);
