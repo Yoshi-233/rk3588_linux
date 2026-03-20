@@ -10698,6 +10698,14 @@ static void vop3_init_esmart_scale_engine(struct vop2 *vop2)
 
 static int vop2_plane_init(struct vop2 *vop2, struct vop2_win *win, unsigned long possible_crtcs)
 {
+	/*
+		private：获取 Rockchip DRM 私有数据结构体，包含平台自定义的 DRM 属性（如色域、EOTF 等）。
+		blend_caps：定义 Plane 支持的混合模式：
+		DRM_MODE_BLEND_PIXEL_NONE：无混合；
+		DRM_MODE_BLEND_PREMULTI：预乘 Alpha 混合；
+		DRM_MODE_BLEND_COVERAGE：覆盖 Alpha 混合。
+		max_width/max_height：临时变量，用于存储 Plane 输入 / 输出的最大宽高。
+	*/
 	struct rockchip_drm_private *private = vop2->drm_dev->dev_private;
 	unsigned int blend_caps = BIT(DRM_MODE_BLEND_PIXEL_NONE) | BIT(DRM_MODE_BLEND_PREMULTI) |
 				  BIT(DRM_MODE_BLEND_COVERAGE);
@@ -10706,6 +10714,8 @@ static int vop2_plane_init(struct vop2 *vop2, struct vop2_win *win, unsigned lon
 
 	/*
 	 * Some userspace software don't want use afbc plane
+	 WIN_FEATURE_AFBDC：表示该 Plane 支持 AFBC (Arm Frame Buffer Compression) 帧缓冲压缩。
+	若用户态配置禁用 AFBC (disable_afbc_win)，但当前 Plane 强制启用 AFBC，则拒绝初始化。
 	 */
 	if (win->feature & WIN_FEATURE_AFBDC) {
 		if (vop2->disable_afbc_win)
@@ -10714,6 +10724,8 @@ static int vop2_plane_init(struct vop2 *vop2, struct vop2_win *win, unsigned lon
 
 	/*
 	 * Some userspace software don't want cluster sub plane
+	 WIN_FEATURE_CLUSTER_SUB：表示该 Plane 是 “集群子平面”（多区域拼接显示的子图层）。
+	若 VOP2 硬件不支持多区域显示 (support_multi_area=0)，但当前 Plane 是集群子平面，则拒绝初始化。
 	 */
 	if (!vop2->support_multi_area) {
 		if (win->feature & WIN_FEATURE_CLUSTER_SUB)
@@ -10721,9 +10733,19 @@ static int vop2_plane_init(struct vop2 *vop2, struct vop2_win *win, unsigned lon
 	}
 
 	/* ignore some plane register according vop3 esmart lb mode */
+	// VOP3 特有的 ESmart LineBuffer（智能行缓冲）模式下，部分 Plane 寄存器需被忽略，此时该 Plane 无需初始化，直接返回拒绝
 	if (vop3_ignore_plane(vop2, win))
 		return -EACCES;
 
+	/*
+		&win->base：Plane 的基础结构体（struct drm_plane）；
+		possible_crtcs：该 Plane 可绑定的 CRTC 掩码；
+		vop2_plane_funcs：Plane 的操作函数集（如更新、销毁、属性设置等）；
+		win->formats/nformats：Plane 支持的像素格式列表及数量；
+		format_modifiers：像素格式修饰符（如 AFBC、Tiling 等）；
+		win->type：Plane 类型（如主图层、光标层、覆盖层）；
+		win->name：Plane 名称（用于调试）
+	*/
 	ret = drm_universal_plane_init(vop2->drm_dev, &win->base, possible_crtcs,
 				       &vop2_plane_funcs, win->formats, win->nformats,
 				       win->format_modifiers, win->type, win->name);
@@ -10732,37 +10754,61 @@ static int vop2_plane_init(struct vop2 *vop2, struct vop2_win *win, unsigned lon
 		return ret;
 	}
 
+	/*
+		drm_plane_helper_add：为 Plane 注册辅助函数集（vop2_plane_helper_funcs），
+		包含硬件相关的实现（如 atomic_check、atomic_update 等），是 DRM 原子模式下的核心回调。
+	*/
 	drm_plane_helper_add(&win->base, &vop2_plane_helper_funcs);
 
+	// 绑定 EOTF（电光转换函数）属性（用于 HDR 显示）
 	drm_object_attach_property(&win->base.base, private->eotf_prop, 0);
+	// 绑定色彩空间属性（如 sRGB、BT.2020 等）
 	drm_object_attach_property(&win->base.base, private->color_space_prop, 0);
+	// 绑定异步提交属性（控制 Plane 更新是否异步）
 	drm_object_attach_property(&win->base.base, private->async_commit_prop, 0);
 
+	// 集群平面绑定共享 ID 属性（用于多平面拼接）
 	if (win->feature & (WIN_FEATURE_CLUSTER_SUB | WIN_FEATURE_CLUSTER_MAIN))
 		drm_object_attach_property(&win->base.base, private->share_id_prop, win->plane_id);
 
+	// 父子平面绑定共享 ID（子平面继承父平面 ID）
+	// 共享 ID（share_id_prop）：集群平面 / 父子平面通过该 ID 关联，保证拼接 / 层级显示的一致性。
 	if (win->parent)
 		drm_object_attach_property(&win->base.base, private->share_id_prop,
 					   win->parent->base.base.id);
 	else
 		drm_object_attach_property(&win->base.base, private->share_id_prop,
 					   win->base.base.id);
+	/* 
+		drm_plane_create_rotation_property：创建旋转属性，支持的旋转模式由 win->supported_rotations 定义（如 90°、180°、270° 旋转、镜像等）；
+		初始旋转角度为 DRM_MODE_ROTATE_0（无旋转）。
+	*/
 	if (win->supported_rotations)
 		drm_plane_create_rotation_property(&win->base, DRM_MODE_ROTATE_0,
 						   DRM_MODE_ROTATE_0 | win->supported_rotations);
+	// 创建 Alpha 混合属性，用于控制 Plane 的整体透明度（0 全透明，1 不透明）
 	drm_plane_create_alpha_property(&win->base);
+	// 基于前面定义的 blend_caps，创建混合模式属性，用户态可选择无混合、预乘 Alpha、覆盖 Alpha 等模式。
 	drm_plane_create_blend_mode_property(&win->base, blend_caps);
+	/*
+		Zpos：控制多个 Plane 的显示层级（值越大，图层越靠上）；
+		初始值为 win->win_id，范围 0 ~ registered_num_wins-1（registered_num_wins 是 VOP2 支持的总 Plane 数）
+	*/
 	drm_plane_create_zpos_property(&win->base, win->win_id, 0, vop2->registered_num_wins - 1);
+	// 平台自定义属性，用于暴露 Plane 的名称和硬件特性给用户态。
 	vop2_plane_create_name_property(vop2, win);
 	vop2_plane_create_feature_property(vop2, win);
 	max_width = vop2->data->max_input.width;
 	max_height = vop2->data->max_input.height;
 	if (win->feature & WIN_FEATURE_CLUSTER_SUB)
-		max_width >>= 1;
+		max_width >>= 1; // 集群子平面：输入宽度减半（硬件限制）
+	// DRM_MODE_PROP_IMMUTABLE：属性创建后不可修改，用于描述硬件固有能力；
+	// 集群子平面的输入宽度减半，是因为子平面仅负责拼接显示的一部分区域。
 	win->input_width_prop = drm_property_create_range(vop2->drm_dev, DRM_MODE_PROP_IMMUTABLE,
 							  "INPUT_WIDTH", 0, max_width);
 	win->input_height_prop = drm_property_create_range(vop2->drm_dev, DRM_MODE_PROP_IMMUTABLE,
 							   "INPUT_HEIGHT", 0, max_height);
+	// vop3_esmart_linebuffer_size：计算 VOP3 智能行缓冲支持的最大输出宽度（行缓冲大小决定输出宽度上限）。
 	max_width = vop3_esmart_linebuffer_size(vop2, win);
 	max_height = vop2->data->max_output.height;
 	if (win->feature & WIN_FEATURE_CLUSTER_SUB)
@@ -10771,6 +10817,12 @@ static int vop2_plane_init(struct vop2 *vop2, struct vop2_win *win, unsigned lon
 							   "OUTPUT_WIDTH", 0, max_width);
 	win->output_height_prop = drm_property_create_range(vop2->drm_dev, DRM_MODE_PROP_IMMUTABLE,
 							    "OUTPUT_HEIGHT", 0, max_height);
+	/*
+		创建缩放比例属性，限制 Plane 的缩放能力：
+		下限：max_downscale_factor（最大缩小比例，如 1/4）；
+		上限：max_upscale_factor（最大放大比例，如 4）；
+		该属性不可修改，对应硬件缩放模块的固有能力。
+	*/
 	win->scale_prop = drm_property_create_range(vop2->drm_dev, DRM_MODE_PROP_IMMUTABLE,
 						    "SCALE_RATE", win->max_downscale_factor,
 						    win->max_upscale_factor);
@@ -10778,6 +10830,10 @@ static int vop2_plane_init(struct vop2 *vop2, struct vop2_win *win, unsigned lon
 	 * Support 24 bit(RGB888) or 16 bit(rgb565) color key.
 	 * Bit 31 is used as a flag to disable (0) or enable
 	 * color keying (1).
+	 * 色键功能：当 Plane 像素值等于色键值时，该像素透明（用于图层抠图）；
+		属性范围 0 ~ 0x80ffffff：
+		Bit 31（0x80000000）：启用 / 禁用色键（1 启用，0 禁用）；
+		Bit 0~23：RGB888 色键值（兼容 RGB565，高位自动忽略）。
 	 */
 	win->color_key_prop = drm_property_create_range(vop2->drm_dev, 0, "colorkey", 0,
 							0x80ffffff);
@@ -10821,6 +10877,7 @@ static struct drm_plane *vop2_cursor_plane_init(struct vop2_video_port *vp)
 		if (win->possible_crtcs)
 			possible_crtcs = win->possible_crtcs;
 		win->type = DRM_PLANE_TYPE_CURSOR;
+		// cursor是最高的
 		win->zpos = vop2->registered_num_wins - 1;
 		if (!vop2_plane_init(vop2, win, possible_crtcs))
 			cursor = &win->base;
@@ -10882,6 +10939,10 @@ static int vop2_gamma_init(struct vop2 *vop2)
 	return 0;
 }
 
+/*
+	为 CRTC 创建「PLANE_MASK」属性，标记该 CRTC 可使用的 硬件图层（Win）
+	资源（对应 ROCKCHIP_VOP2_CLUSTER0/ESMART0 等硬件图层类型），本质是「CRTC 与图层的绑定权限位图」
+*/
 static int vop2_crtc_create_plane_mask_property(struct vop2 *vop2,
 						struct drm_crtc *crtc,
 						uint32_t plane_mask)
@@ -10932,11 +10993,11 @@ static int vop2_crtc_create_feature_property(struct vop2 *vop2, struct drm_crtc 
 	};
 
 	if (vp_data->feature & VOP_FEATURE_ALPHA_SCALE)
-		feature |= BIT(ROCKCHIP_DRM_CRTC_FEATURE_ALPHA_SCALE);
+		feature |= BIT(ROCKCHIP_DRM_CRTC_FEATURE_ALPHA_SCALE); // 支持 Alpha 缩放，置位对应 bit
 	if (vp_data->feature & VOP_FEATURE_HDR10)
-		feature |= BIT(ROCKCHIP_DRM_CRTC_FEATURE_HDR10);
+		feature |= BIT(ROCKCHIP_DRM_CRTC_FEATURE_HDR10); // HDR10
 	if (vp_data->feature & VOP_FEATURE_NEXT_HDR)
-		feature |= BIT(ROCKCHIP_DRM_CRTC_FEATURE_NEXT_HDR);
+		feature |= BIT(ROCKCHIP_DRM_CRTC_FEATURE_NEXT_HDR); // 下一代HDR
 
 	prop = drm_property_create_bitmask(vop2->drm_dev,
 					   DRM_MODE_PROP_IMMUTABLE, "FEATURE",
@@ -10959,6 +11020,7 @@ static int vop2_crtc_create_feature_property(struct vop2 *vop2, struct drm_crtc 
 	vp->output_width_prop = prop;
 	drm_object_attach_property(&crtc->base, vp->output_width_prop, 0);
 
+	// rockchip_drm_get_dclk_by_width 函数根据最大输出宽度，计算该 CRTC 支持的最大 DCLK（单位 KHz，乘以 1000 转为 Hz）
 	prop = drm_property_create_range(vop2->drm_dev, DRM_MODE_PROP_IMMUTABLE, "OUTPUT_DCLK",
 					 0, rockchip_drm_get_dclk_by_width(vop2->data->vp[vp->id].max_output.width) * 1000);
 	if (!prop) {
@@ -10971,6 +11033,7 @@ static int vop2_crtc_create_feature_property(struct vop2 *vop2, struct drm_crtc 
 	return 0;
 }
 
+/* 为 CRTC 创建「可变刷新率（VRR）」相关的 3 个范围属性，支持用户态动态配置刷新率区间（如 30Hz~144Hz），适配高刷新率屏幕（如电竞屏、高刷手机屏） */
 static int vop2_crtc_create_vrr_property(struct vop2 *vop2, struct drm_crtc *crtc)
 {
 	struct vop2_video_port *vp = to_vop2_video_port(crtc);
@@ -11082,6 +11145,7 @@ static int vop2_create_crtc(struct vop2 *vop2)
 	struct rockchip_drm_private *private = drm_dev->dev_private;
 
 	/* all planes can attach to any crtc */
+	// 标记 Plane 可挂载的 CRTC，每 1 位对应 1 个 CRTC 索引
 	possible_crtcs = (1 << vop2_data->nr_vps) - 1;
 
 	/*
@@ -11090,6 +11154,9 @@ static int vop2_create_crtc(struct vop2 *vop2)
 	 * the bootloader don't initialized the vop, or
 	 * something is wrong, the kernel will try to
 	 * initial all the vp.
+	 * plane_mask 来自设备树 DTS 或 Bootloader（Uboot），标记 VP 已分配的硬件 Win。
+	   若任意 VP 的plane_mask非零，说明 Bootloader 已初始化 VOP2（比如 Uboot 阶段显示了开机 Logo），标记bootloader_initialized=true。
+	   设计意图：后续若 Bootloader 已初始化，plane_mask=0的 VP 会被视为未使用，内核跳过初始化，避免与 Bootloader 的显示配置冲突，保证开机画面的连续性。
 	 */
 	for (i = 0; i < vop2_data->nr_vps; i++) {
 		vp = &vop2->vps[i];
@@ -11105,7 +11172,30 @@ static int vop2_create_crtc(struct vop2 *vop2)
 	 * "possible_crtcs" to the newly initialized crtc.
 	 */
 	for (i = 0; i < vop2_data->nr_vps; i++) {
+		// 遍历每一个vp
+		/*
+			{
+				.id = 0,
+				.splice_vp_id = 1,
+				.lut_dma_rid = 0xd,
+				.soc_id = { 0x3588, 0x3588 },
+				.feature = VOP_FEATURE_OUTPUT_10BIT | VOP_FEATURE_ALPHA_SCALE |
+						VOP_FEATURE_HDR10 | VOP_FEATURE_NEXT_HDR,
+				.gamma_lut_len = 1024,
+				.cubic_lut_len = 729, // 9x9x9 
+				.dclk_max = 600000000,
+				.max_output = { 7680, 4320 },
+				// hdr2sdr sdr2hdr hdr2hdr sdr2sdr 
+				.pre_scan_max_dly = { 76, 65, 65, 54 },
+				.intr = &rk3568_vp0_intr,
+				.hdr_table = &rk3568_vop_hdr_table,
+				.regs = &rk3588_vop_vp0_regs,
+			},
+		*/
 		vp_data = &vop2_data->vp[i];
+		
+		// 从芯片 BSP 中获取当前 VP 的硬件配置（寄存器基地址、支持的功能、最大分辨率等），完成 VP 软件实例的基础赋值。
+		// cursor_win_id=-1 初始化为无效值，表示未指定光标图层。	
 		vp = &vop2->vps[i];
 		vp->vop2 = vop2;
 		vp->id = vp_data->id;
@@ -11114,12 +11204,17 @@ static int vop2_create_crtc(struct vop2 *vop2)
 		primary = NULL;
 		cursor = NULL;
 
+		/*
+			disable_win_move 来自设备树配置，若为真，禁止硬件 Win 在不同 VP 之间移动。
+			此时possible_crtcs仅保留当前正在注册的 CRTC 对应的位，Plane 只能挂载到当前 CRTC，不能跨 VP 使用
+		 */
 		if (vop2->disable_win_move)
 			possible_crtcs = BIT(registered_num_crtcs);
 
 		/*
 		 * we assume a vp with a zere plane_mask(set from dts or bootloader)
 		 * as unused.
+		 * 若 Bootloader 已初始化 VOP2，且当前 VP 的plane_mask=0，说明该 VP 未被 Bootloader 使用，内核直接跳过初始化，不创建对应的 CRTC。
 		 */
 		if (!vp->plane_mask && bootloader_initialized)
 			continue;
@@ -11129,6 +11224,20 @@ static int vop2_create_crtc(struct vop2 *vop2)
 		else
 			soc_id = vp_data->soc_id[0];
 
+		/*
+			#define DCLK_VOP0_SRC			625
+			#define DCLK_VOP1_SRC			626
+			#define DCLK_VOP2_SRC			627
+			#define DCLK_VOP0			628
+			#define DCLK_VOP1			629
+			#define DCLK_VOP2			630
+			#define DCLK_VOP3			631
+			dclk_vp%d：VP 的像素时钟，是显示的核心时钟，决定了显示时序的像素输出频率，直接影响分辨率和刷新率，是 VP 工作的必要条件。
+			dclk_rst：像素时钟域的复位控制器，用于后续硬件复位。
+			dclk_src_vp%d：像素时钟的父时钟源，可选配置，部分场景下时钟源由 HDMI/MIPI 等外设提供。
+			若时钟 / 复位获取失败，直接返回错误码，无像素时钟时 VP 无法完成任何显示输出
+			同一个硬件模块的 “时钟” 和 “复位”，会复用相同的名称前缀，只是对应的 “资源类型” 不同。
+		*/
 		snprintf(clk_name, sizeof(clk_name), "dclk_vp%d", vp->id);
 		vp->dclk_rst = devm_reset_control_get_optional(vop2->dev, clk_name);
 		if (IS_ERR(vp->dclk_rst)) {
@@ -11150,7 +11259,13 @@ static int vop2_create_crtc(struct vop2 *vop2)
 		}
 
 		crtc = &vp->rockchip_crtc.crtc;
-
+		/*
+			从 VOP2 的设备树节点中，获取对应 ID 的port子节点：设备树的port对应 VP 的物理输出端口，用于和 HDMI、MIPI、LVDS 等显示外设的endpoint绑定，是 CRTC 连接显示屏幕的桥梁。
+			从port节点读取cursor-win-id属性，即设备树指定的、该 VP 用作光标的硬件 Win 物理 ID
+			DRM 框架层面：不需要必须执行 crtc->port = port，框架不依赖这个字段，只要完成 CRTC 核心注册步骤，CRTC 就能在框架中 “使能”；
+			瑞芯微驱动层面：必须执行 crtc->port = port，因为驱动自己的链路绑定、硬件配置逻辑，完全依赖 crtc->port 指向设备树 port 节点；
+			本质区别：crtc->port 是瑞芯微驱动 “借用” DRM CRTC 结构体的一个字段，用来存储自己的设备树节点指针，是厂商驱动的实现选择，而非框架强制规则。
+		*/
 		port = of_graph_get_port_by_id(dev->of_node, i);
 		if (!port) {
 			DRM_DEV_ERROR(vop2->dev, "no port node found for video_port%d\n", i);
@@ -11166,14 +11281,19 @@ static int vop2_create_crtc(struct vop2 *vop2)
 				plane_mask &= ~RK3566_MIRROR_PLANE_MASK;
 			}
 		}
-
+		
+		// primary win和overlay win
 		if (vp->primary_plane_phy_id >= 0) {
+			// 主图层是 CRTC 的必选资源
 			win = vop2_find_win_by_phys_id(vop2, vp->primary_plane_phy_id);
 			if (win) {
 				find_primary_plane = true;
 				win->type = DRM_PLANE_TYPE_PRIMARY;
 			}
 		} else {
+			// 自动遍历查找可用的主图层
+			// 遍历所有已注册的硬件 Win，跳过子窗口、簇子窗口（硬件限制不能做主图层）、已被其他 VP 占用的主图层。
+			// 找到第一个可用的 Win，标记为当前 VP 的主图层。
 			j = 0;
 			while (j < vop2->registered_num_wins) {
 				be_used_for_primary_plane = false;
@@ -11185,7 +11305,8 @@ static int vop2_create_crtc(struct vop2 *vop2)
 
 				if (win->type != DRM_PLANE_TYPE_PRIMARY)
 					continue;
-
+				
+				// 当前win是其他vp的primary plane
 				for (k = 0; k < vop2_data->nr_vps; k++) {
 					if (win->phys_id == vop2->vps[k].primary_plane_phy_id) {
 						be_used_for_primary_plane = true;
@@ -11209,7 +11330,12 @@ static int vop2_create_crtc(struct vop2 *vop2)
 			break;
 		} else {
 			/* give lowest zpos for primary plane */
+			// 给主图层设置最低 zpos（zpos 越小，图层越靠下，主图层在最底层）
+			// 以系统 CRTC 总数为基准，给窗口分配初始 zpos，确保窗口 Plane 在所有底层 CRTC Plane 之上，避免层级冲突，同时简化跨 CRTC 窗口的深度管理。
+			// 如果按 “每个 CRTC 独立分配 zpos”（比如 CRTC0 的 zpos 0-100，CRTC1 的 zpos 0-100），
+			// 窗口跨 CRTC 时需要重新计算 zpos，极易冲突；
 			win->zpos = registered_num_crtcs;
+			// 3588没有确定possible_crtcs
 			if (win->possible_crtcs)
 				possible_crtcs = win->possible_crtcs;
 			if (vop2_plane_init(vop2, win, possible_crtcs)) {
@@ -11220,6 +11346,10 @@ static int vop2_create_crtc(struct vop2 *vop2)
 		}
 
 		/* some times we want a cursor window for some vp */
+		/* 
+			若设备树未指定光标图层，自动遍历查找未被占用的、类型为CURSOR的硬件 Win；
+			调用vop2_cursor_plane_init完成光标图层的 DRM 注册，初始化失败仅打印警告，不影响 CRTC 的核心功能。
+		*/
 		if (vp->cursor_win_id < 0) {
 			bool be_used_for_cursor_plane = false;
 
@@ -11252,6 +11382,13 @@ static int vop2_create_crtc(struct vop2 *vop2)
 					     cursor->name, vp->id);
 		}
 
+		/*
+			调用 DRM 框架的标准 API drm_crtc_init_with_planes，完成 CRTC 的核心注册：
+			绑定必选的主图层primary和可选的光标图层cursor；
+			挂载 CRTC 的操作函数集vop2_crtc_funcs（实现复位、状态复制、属性读写等回调）；
+			给 CRTC 命名为video_port%d，与硬件 VP 一一对应。
+			初始化失败直接返回错误码，这是 CRTC 创建的核心节点。
+		*/
 		ret = drm_crtc_init_with_planes(drm_dev, crtc, primary, cursor, &vop2_crtc_funcs,
 						"video_port%d", vp->id);
 		if (ret) {
@@ -11259,13 +11396,29 @@ static int vop2_create_crtc(struct vop2 *vop2)
 			return ret;
 		}
 
+		// 绑定 CRTC 的辅助函数集vop2_crtc_helper_funcs
 		drm_crtc_helper_add(crtc, &vop2_crtc_helper_funcs);
-
+		// drm_flip_work_init：初始化帧 buffer 解引用工作队列，用于页面翻转后延迟释放旧的 framebuffer，
+		// 避免硬件还在访问时就释放内存，导致内存访问错误。
 		drm_flip_work_init(&vp->fb_unref_work, "fb_unref", vop2_fb_unref_worker);
 
+		// 初始化两个完成量，用于中断上下文与进程上下文的同步，比如等待硬件帧完成、行中断触发等。
 		init_completion(&vp->dsp_hold_completion);
 		init_completion(&vp->line_flag_completion);
+		// 注册瑞芯微私有扩展的 CRTC 函数，比如 loader 保护、带宽计算、debugfs 调试、待机 / 唤醒等平台特有功能。
 		rockchip_register_crtc_funcs(crtc, &private_crtc_funcs);
+
+		/*
+			DRM 框架通过属性向用户空间（如 Android SurfaceFlinger、Weston）
+			暴露硬件配置能力，这部分代码为 CRTC 创建并挂载了标准属性与瑞芯微私有属性
+			属性类型	核心作用
+			基础标识属性	soc_id/port_id：供用户空间识别硬件型号与端口号
+			基础控制属性	aclk_prop（AXI 时钟）、bg_prop（背景色）、line_flag_prop（行中断标记）
+			显示适配属性	过扫描边距属性：适配老电视的画面裁剪调整
+			功能能力属性	FEATURE 属性：标记 CRTC 支持的 HDR10、ALPHA 缩放、最大分辨率 / 时钟等能力
+			高级功能属性	VRR（可变刷新率）、HDR 元数据、ACM 自动色彩管理、CSC 色彩空间转换等属性
+			低功耗属性	自刷新助手：支持 PSR 面板自刷新，降低静态画面功耗
+		*/
 		soc_id = vop2_soc_id_fixup(soc_id);
 		drm_object_attach_property(&crtc->base, private->soc_id_prop, soc_id);
 		drm_object_attach_property(&crtc->base, private->port_id_prop, vp->id);
@@ -11305,6 +11458,8 @@ static int vop2_create_crtc(struct vop2 *vop2)
 
 	/*
 	 * change the unused primary window to overlay window
+	 遍历所有硬件 Win，若某个 Win 被标记为PRIMARY类型，但未被任何 VP 用作主图层，将其类型修改为OVERLAY叠加图层。
+	 设计意图：避免硬件 Win 资源浪费，让未被使用的主图层可以作为普通叠加图层使用。
 	 */
 	for (j = 0; j < vop2->registered_num_wins; j++) {
 		win = &vop2->win[j];
@@ -11325,6 +11480,11 @@ static int vop2_create_crtc(struct vop2 *vop2)
 	/*
 	 * create overlay planes of the leftover overlay win
 	 * Create drm_planes for overlay windows with possible_crtcs restricted
+	 * 遍历所有类型为OVERLAY的硬件 Win，完成 DRM 注册：
+	   单屏显示时（注册 CRTC 数量 < 2），跳过 RK3566 的镜像图层，避免资源浪费；
+	   设置叠加图层的 zpos，层级高于主图层、低于光标图层；
+	   根据disable_win_move配置，限制图层可挂载的 CRTC；
+	   调用vop2_plane_init完成图层注册，失败仅打印警告，不影响核心显示功能。
 	 */
 	for (j = 0; j < vop2->registered_num_wins; j++) {
 		win = &vop2->win[j];
@@ -11356,7 +11516,7 @@ static int vop2_create_crtc(struct vop2 *vop2)
 		if (ret)
 			DRM_WARN("failed to init overlay plane %s\n", win->name);
 	}
-
+	// 缩放引擎
 	if (is_vop3(vop2))
 		vop3_init_esmart_scale_engine(vop2);
 
