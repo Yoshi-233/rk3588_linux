@@ -11412,7 +11412,10 @@ static int vop2_pd_data_init(struct vop2 *vop2)
 
 	return 0;
 }
-
+/*
+	DSC（Display Stream Compression，显示流压缩）相关硬件参数进行初始化 的核心函数，
+	常见于嵌入式系统（如机顶盒、智能电视、车载中控）的视频驱动层代码中。
+*/
 static void vop2_dsc_data_init(struct vop2 *vop2)
 {
 	const struct vop2_data *vop2_data = vop2->data;
@@ -11595,6 +11598,11 @@ static void post_buf_empty_work_event(struct work_struct *work)
 	}
 }
 
+/*
+	1.所有图层窗口不会被重复分配给不同的 VP（Video Processor，视频处理单元）；
+	2.所有图层窗口都被完整分配（无遗漏、无多余）。
+	函数返回 true 表示检查通过（掩码配置合法），返回 false 表示配置非法，并输出对应的警告日志。
+*/
 static bool vop2_plane_mask_check(struct vop2 *vop2)
 {
 	const struct vop2_data *vop2_data = vop2->data;
@@ -11608,6 +11616,7 @@ static bool vop2_plane_mask_check(struct vop2 *vop2)
 	if (vop2->version != VOP_VERSION_RK3568 && vop2->version != VOP_VERSION_RK3588)
 		return true;
 
+	// 检查「图层窗口不重复分配」
 	for (i = 0; i < vop2_data->nr_vps; i++) {
 		if (plane_mask & vop2->vps[i].plane_mask) {
 			DRM_WARN("the same window can't be assigned to two vp\n");
@@ -11616,6 +11625,17 @@ static bool vop2_plane_mask_check(struct vop2 *vop2)
 		plane_mask |= vop2->vps[i].plane_mask;
 	}
 
+	/*
+		检查「所有图层窗口都被分配（无遗漏 / 无多余）」
+		hweight32(plane_mask) != vop2_data->nr_layers
+		hweight32：内核函数，计算 32 位整数中「值为 1 的位的数量」（即「汉明重量」）；
+		vop2_data->nr_layers：VOP2 模块支持的总图层数量；
+		逻辑：已分配的图层数量（hweight32(plane_mask)）≠ 总图层数量 → 说明有图层未分配，或分配了多余的图层；
+		plane_mask != vop2_data->plane_mask_base
+		vop2_data->plane_mask_base：VOP2 模块的「完整图层掩码基准值」（比如总共有 4 个图层，则基准值是 0b1111，即 0xF）；
+		逻辑：已分配的掩码总和 ≠ 基准掩码 → 说明掩码不匹配（比如漏了某一位，或多了某一位）；
+		错误处理：如果任一条件不满足，打印警告日志（提示完整掩码和当前掩码），返回 false（配置非法
+	*/
 	if (hweight32(plane_mask) != vop2_data->nr_layers ||
 	    plane_mask != vop2_data->plane_mask_base) {
 		DRM_WARN("all windows should be assigned, full plane mask: 0x%x, current plane mask: 0x%x\n",
@@ -11663,6 +11683,7 @@ static void vop2_plane_mask_assign(struct vop2 *vop2, struct device_node *vop_ou
 	int vp_id;
 	int i = 0;
 
+	// 统计激活的 VP 数量
 	for_each_child_of_node(vop_out_node, child) {
 		if (vop2_get_vp_of_status(child))
 			active_vp_num++;
@@ -11670,12 +11691,34 @@ static void vop2_plane_mask_assign(struct vop2 *vop2, struct device_node *vop_ou
 
 	if (vop2_soc_is_rk3566() && active_vp_num > 2)
 		DRM_WARN("RK3566 only support 2 vps\n");
+
+	/*
+		{        // main display 
+			.primary_plane_id = ROCKCHIP_VOP2_ESMART0,
+			.attached_layers_nr = 8,
+			.attached_layers = {
+				  ROCKCHIP_VOP2_CLUSTER0, ROCKCHIP_VOP2_ESMART0, ROCKCHIP_VOP2_ESMART2,
+				  ROCKCHIP_VOP2_CLUSTER1, ROCKCHIP_VOP2_ESMART1, ROCKCHIP_VOP2_ESMART3,
+				  ROCKCHIP_VOP2_CLUSTER2, ROCKCHIP_VOP2_CLUSTER3
+			},
+		},
+	*/
 	plane_mask = vop2_data->plane_mask;
+	/*
+		(active_vp_num - 1) * ROCKCHIP_MAX_CRTC：根据激活的 VP 数量，偏移到对应的配置段。
+		举例：
+		若激活 1 个 VP，偏移0 * ROCKCHIP_MAX_CRTC，取第 1 段配置；
+		若激活 2 个 VP，偏移1 * ROCKCHIP_MAX_CRTC，取第 2 段配置；
+		ROCKCHIP_MAX_CRTC是 Rockchip DRM 驱动中最大的 CRTC（显示控制器）数量，通常为 2/4，用于划分不同 VP 数量的配置区间。
+		plane_mask是数组，ROCKCHIP_MAX_CRTC个
+	*/
 	plane_mask += (active_vp_num - 1) * ROCKCHIP_MAX_CRTC;
 
 	for_each_child_of_node(vop_out_node, child) {
 		of_property_read_u32(child, "reg", &vp_id);
 		if (vop2_get_vp_of_status(child)) {
+			// vop2_vp_plane_mask_to_bitmap：将芯片预设的 plane mask 格式（如数组 / 结构体）转换为驱动内部使用的位图（bitmap），方便快速判断图层是否可用。
+			// layer承载plane
 			vop2->vps[vp_id].plane_mask = vop2_vp_plane_mask_to_bitmap(&plane_mask[i]);
 			vop2->vps[vp_id].primary_plane_phy_id = plane_mask[i].primary_plane_id;
 			i++;
@@ -11905,7 +11948,31 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 			of_property_read_u32(child, "rockchip,primary-plane", &primary_plane_phy_id);
 			of_property_read_u32(child, "reg", &vp_id);
 
-			// 这里设备树没写
+			/*
+				&vp0 {
+					rockchip,plane-mask = <(1 << ROCKCHIP_VOP2_CLUSTER0 | 1 << ROCKCHIP_VOP2_ESMART0)>;
+					rockchip,primary-plane = <ROCKCHIP_VOP2_ESMART0>;
+					// cursor-win-id = <ROCKCHIP_VOP2_CLUSTER0>;
+				};
+
+				&vp1 {
+					rockchip,plane-mask = <(1 << ROCKCHIP_VOP2_CLUSTER1 | 1 << ROCKCHIP_VOP2_ESMART1)>;
+					rockchip,primary-plane = <ROCKCHIP_VOP2_ESMART1>;
+					cursor-win-id = <ROCKCHIP_VOP2_CLUSTER1>;
+				};
+
+				&vp2 {
+					rockchip,plane-mask = <(1 << ROCKCHIP_VOP2_CLUSTER2 | 1 << ROCKCHIP_VOP2_ESMART2)>;
+					rockchip,primary-plane = <ROCKCHIP_VOP2_ESMART2>;
+					cursor-win-id = <ROCKCHIP_VOP2_CLUSTER2>;
+				};
+
+				&vp3 {
+					rockchip,plane-mask = <(1 << ROCKCHIP_VOP2_CLUSTER3 | 1 << ROCKCHIP_VOP2_ESMART3)>;
+					rockchip,primary-plane = <ROCKCHIP_VOP2_ESMART3>;
+					cursor-win-id = <ROCKCHIP_VOP2_CLUSTER3>;
+				};
+			*/
 			vop2->vps[vp_id].plane_mask = plane_mask;
 			if (plane_mask)
 				vop2->vps[vp_id].primary_plane_phy_id = primary_plane_phy_id;
@@ -11942,6 +12009,8 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 		}
 
 		if (!vop2_plane_mask_check(vop2)) {
+			// DRM_WARN：打印内核警告日志，提示 “使用默认的 plane mask”（用户 / 驱动未自定义配置，需兜底）。
+			// vop2_plane_mask_assign：调用赋值函数，为 VOP2 的各个 VP（Video Pipeline，视频管线）分配默认的 plane mask 和主图层 ID。
 			DRM_WARN("use default plane mask\n");
 			vop2_plane_mask_assign(vop2, vop_out_node);
 		}
@@ -11953,6 +12022,7 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 		}
 	}
 
+	// hdmi时钟
 	vop2_extend_clk_init(vop2);
 	spin_lock_init(&vop2->reg_lock);
 	spin_lock_init(&vop2->irq_lock);
