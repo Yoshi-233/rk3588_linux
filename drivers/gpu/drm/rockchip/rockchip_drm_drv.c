@@ -1127,6 +1127,15 @@ static int rockchip_drm_fault_handler(struct iommu_domain *iommu,
 	return 0;
 }
 
+/*
+	该函数是 Rockchip DRM 驱动中 IOMMU 子系统的核心初始化接口，专为显示场景设计，
+	负责搭建「虚拟地址→物理地址」的转换环境、内存隔离与故障处理机制，
+	确保 VOP、HDMI 等显示硬件能安全、高效地访问显存（GEM 对象）
+
+	IOMMU 的核心用途：不是单纯给显示 buffer 分配内存，而是为显示硬件（VOP、HDMI 等）提供「地址转换 + 内存隔离 + 故障保护」，解决显示链路的内存安全、地址冲突、平台兼容问题；
+	是否给显示 buffer 用：是，但仅负责「显示 buffer 的虚拟地址（IOVA）→ 物理地址（PA）映射」，不直接分配 buffer 大小，buffer 大小由用户态（如 APP、 compositor）按分辨率需求申请；
+	大小确定逻辑：IOMMU 自身的地址空间大小（start~end）由硬件规格 + 设备树配置决定；显示 buffer 的大小由分辨率、像素格式计算（如 1080p@32bit 约 8MB），且不能超过 IOMMU 地址空间上限。
+*/
 static int rockchip_drm_init_iommu(struct drm_device *drm_dev)
 {
 	struct rockchip_drm_private *private = drm_dev->dev_private;
@@ -1137,6 +1146,11 @@ static int rockchip_drm_init_iommu(struct drm_device *drm_dev)
 	if (!is_support_iommu)
 		return 0;
 
+	/*
+		iommu_domain_alloc：Linux IOMMU 子系统标准 API，为「platform 总线设备」分配独立的 IOMMU 域；
+		关键概念：IOMMU 域是「地址转换的隔离单元」，每个域有独立的页表，
+		显示硬件的地址转换仅在该域内生效，避免与其他设备（如 GPU、DMA）的地址冲突；
+	*/
 	private->domain = iommu_domain_alloc(&platform_bus_type);
 	if (!private->domain)
 		return -ENOMEM;
@@ -1147,9 +1161,22 @@ static int rockchip_drm_init_iommu(struct drm_device *drm_dev)
 
 	DRM_DEBUG("IOMMU context initialized (aperture: %#llx-%#llx)\n",
 		  start, end);
+	/*
+		drm_mm_init：DRM 框架的内存管理器初始化函数，用于管理 IOMMU 虚拟地址空间的分配与释放；
+		第一个参数：private->mm 是 DRM 内存管理器实例；
+		第二个参数：地址空间起始地址（即 aperture_start）；
+		第三个参数：地址空间总大小（end - start + 1）；
+	*/ 
 	drm_mm_init(&private->mm, start, end - start + 1);
 	mutex_init(&private->mm_lock);
-
+	
+	/*
+		iommu_set_fault_handler：注册 IOMMU 访问故障回调函数，当显示硬件访问非法虚拟地址（如越界、未映射）时，触发该回调；
+		回调函数 rockchip_drm_fault_handler 功能（在文档代码中实现）：
+		打印故障标志（flags），提示内存访问异常；
+		遍历所有 CRTC，调用 regs_dump/debugfs_dump 打印硬件寄存器状态，辅助定位故障原因（如哪个 Plane、哪个虚拟地址触发异常）；
+		核心价值：增强驱动的容错性和可调试性，避免硬件访问异常导致系统崩溃。
+	*/
 	iommu_set_fault_handler(private->domain, rockchip_drm_fault_handler,
 				drm_dev);
 
@@ -1457,6 +1484,15 @@ static void rockchip_attach_connector_property(struct drm_device *drm)
 	mutex_unlock(&drm->mode_config.mutex);
 }
 
+/*
+	acquire_ctx 是 DRM (Direct Rendering Manager) 中 原子模式设置（Atomic Mode Setting） 
+	机制的核心上下文对象，全称为 struct drm_modeset_acquire_ctx
+
+	drm_modeset_acquire_ctx 是 DRM 用于 管理模式设置锁的生命周期、避免死锁、追踪锁依赖 的上下文对象，核心解决以下问题：
+	原子提交（atomic commit）过程中需要加锁多个 DRM 对象（CRTC/connector/encoder），acquire_ctx 追踪已获取的锁，确保解锁顺序与加锁顺序相反，避免死锁；
+	统一管理锁的 “获取 - 重试 - 释放” 逻辑，简化原子操作的锁管理；
+	绑定到 drm_mode_config 的 acquire_ctx 是全局默认上下文，供整个 DRM 设备的原子操作复用。
+*/
 static void rockchip_drm_set_property_default(struct drm_device *drm)
 {
 	struct drm_connector *connector;
@@ -1467,11 +1503,20 @@ static void rockchip_drm_set_property_default(struct drm_device *drm)
 
 	drm_modeset_lock_all(drm);
 
+	/*
+		conf->acquire_ctx：drm_mode_config 初始化时会创建一个默认的 acquire_ctx，作为整个 DRM 设备原子操作的全局锁上下文；
+		drm_atomic_helper_duplicate_state：基于传入的 acquire_ctx 复制一份当前的原子状态（包含所有 CRTC/connector/encoder 的状态），
+		同时将 acquire_ctx 关联到新的 atomic_state，用于后续原子操作的锁管理。
+	*/
 	state = drm_atomic_helper_duplicate_state(drm, conf->acquire_ctx);
 	if (IS_ERR(state)) {
 		DRM_ERROR("failed to alloc atomic state\n");
 		goto err_unlock;
 	}
+	/*
+		显式将全局 acquire_ctx 赋值给新创建的 atomic_state，确保后续对 connector_state 的修改、原子提交过程中，锁的获取 / 释放由该上下文管理；
+		若不绑定 acquire_ctx，原子提交时会因无锁上下文导致死锁或锁管理混乱。
+	*/
 	state->acquire_ctx = conf->acquire_ctx;
 
 	drm_connector_list_iter_begin(drm, &conn_iter);
@@ -1485,6 +1530,7 @@ static void rockchip_drm_set_property_default(struct drm_device *drm)
 			continue;
 		}
 
+		// connector_state->tv 及其包含的亮度 / 对比度 / 饱和度 / 色调，是框架为 TV 类接口设计的标准属性，并非 Rockchip 自定义；
 		connector_state->tv.brightness = 50;
 		connector_state->tv.contrast = 50;
 		connector_state->tv.saturation = 50;
@@ -1492,16 +1538,29 @@ static void rockchip_drm_set_property_default(struct drm_device *drm)
 	}
 	drm_connector_list_iter_end(&conn_iter);
 
+	/*
+		drm_atomic_commit(state)：负责将 state 中记录的所有显示状态变更（如亮度 / 对比度修改、分辨率切换、图层移动等）原子化地应用到硬件，调用成功即表示状态已生效（硬件已按新配置工作）；
+		drm_atomic_state_put(state)：在提交完成后，释放 state 结构体占用的内核内存及关联资源（如锁上下文、状态副本），是 DRM 状态管理的 “收尾清理” 操作。
+	*/
 	ret = drm_atomic_commit(state);
 	WARN_ON(ret == -EDEADLK);
 	if (ret)
 		DRM_ERROR("Failed to update properties\n");
+	/*
+		严格成对的 API 是 drm_atomic_state_create ↔ drm_atomic_state_put（创建空状态→释放）；
+		drm_atomic_helper_duplicate_state 是 “复制已有状态” 的变体，其创建的状态容器，
+		最终仍需通过 drm_atomic_state_put 释放，因此是 “逻辑配对” 而非 “API 设计成对
+	*/
 	drm_atomic_state_put(state);
 
 err_unlock:
 	drm_modeset_unlock_all(drm);
 }
 
+/*
+	该函数是 Rockchip DRM 驱动中安全显存池的初始化接口，核心作用是从设备树解析预分配的 “安全内存区域”，
+	并通过 Linux 内核的 gen_pool（通用内存池）机制封装成可动态分配的显存池，专供显示驱动的 GEM buffer 使用。
+*/
 static int rockchip_gem_pool_init(struct drm_device *drm)
 {
 	struct rockchip_drm_private *private = drm->dev_private;
@@ -1523,10 +1582,16 @@ static int rockchip_gem_pool_init(struct drm_device *drm)
 	if (!size)
 		return -ENOMEM;
 
+	// 参数1：PAGE_SHIFT（页偏移，通常为12，对应4KB页大小），表示内存池的最小分配粒度为4KB
+    	// 参数2：-1（CPU 节点，-1 表示不绑定特定CPU）
 	private->secure_buffer_pool = gen_pool_create(PAGE_SHIFT, -1);
 	if (!private->secure_buffer_pool)
 		return -ENOMEM;
 
+	 // 参数1：创建好的内存池
+	// 参数2：内存池的物理起始地址（start）
+	// 参数3：内存池的大小（size）
+	// 参数4：-1（分配器标识，-1 表示默认）
 	gen_pool_add(private->secure_buffer_pool, start, size, -1);
 
 	return 0;
@@ -1615,19 +1680,45 @@ static int rockchip_drm_bind(struct device *dev)
 	drm_dev->irq_enabled = true;
 
 	/* init kms poll for handling hpd */
+	/*
+		drm_kms_helper_poll_init(drm_dev) 是 Linux DRM KMS（Kernel Mode Setting）辅助层的 热插拔（HPD）轮询机制初始化函数，
+		核心作用是为显示设备（如 HDMI、MIPI DSI、DP）初始化「软件轮询检测逻辑」，用于感知显示器的插拔状态
+		创建轮询工作队列：初始化 struct drm_kms_helper_poll 结构体，关联到 DRM 设备（drm_dev），用于管理轮询任务；
+		注册轮询回调函数：绑定默认的轮询处理函数 drm_kms_helper_poll_work，该函数会遍历所有连接器（Connector），调用 connector->funcs->detect 检测设备状态；
+		启动定时轮询：默认设置 1 秒为轮询周期（可通过 drm_kms_helper_poll_enable/disable 调整或启停），内核会周期性执行轮询工作队列。
+		void drm_kms_helper_poll_init(struct drm_device *dev)
+		{
+			INIT_DELAYED_WORK(&dev->mode_config.output_poll_work, output_poll_execute);
+			dev->mode_config.poll_enabled = true;
+
+			drm_kms_helper_poll_enable(dev);
+		}
+	*/
 	drm_kms_helper_poll_init(drm_dev);
 
 	ret = rockchip_drm_init_iommu(drm_dev);
 	if (ret)
 		goto err_unbind_all;
 
+	// 3588已经不用
 	rockchip_gem_pool_init(drm_dev);
+	// reserved-memory
+	/*
+		阶段	                操作	                                    类比	                                                    驱动 / 用户行为
+		1. 系统启动	        设备树定义 reserved-memory	             开发商划定 “DRM 专属仓库”（物理地址 0x70000000，大小 256MB）	内核锁定该内存，禁止普通进程使用
+		2. DRM 初始化	        调用 of_reserved_mem_device_init	    DRM 驱动去 “物业认领仓库产权”，拿到仓库的「地址、大小、钥匙」	 驱动将预留内存信息存入 drm_dev->dev->reserved_mem
+		3. 驱动管控	        驱动划分内存区域	                     驱动把仓库分成 “显存区”“帧缓冲区”“硬件缓存区”	                 开发者自主关联物理地址到不同模块：
+		                       ・显存区：0x70000000 - 0x78000000
+		        	       ・帧缓冲区：0x78000000 - 0x7F000000
+		4. 用户申请 buffer	调用 DRM 接口（如 DRM_IOCTL_MODE_CREATE_DUMB）	用户向驱动 “申请仓库货架”	                                驱动从预留内存的对应区域分配物理地址，返回给用户
+	*/
 	ret = of_reserved_mem_device_init(drm_dev->dev);
 	if (ret)
 		DRM_DEBUG_KMS("No reserved memory region assign to drm\n");
 
 	rockchip_drm_show_logo(drm_dev);
 
+	// 兼容fb驱动，可以不用
 	ret = rockchip_drm_fbdev_init(drm_dev);
 	if (ret)
 		goto err_iommu_cleanup;
@@ -1638,6 +1729,10 @@ static int rockchip_drm_bind(struct device *dev)
 	if (ret)
 		goto err_kms_helper_poll_fini;
 
+	/*
+		该函数是 Rockchip 芯片 DRM / 显示驱动中时钟保护机制的 “收尾清理函数”，核心作用是：释放驱动初始化阶段为了 “保护关键显示时钟不被意外关闭”
+		 而临时持有的时钟资源，完成时钟的 “解锁 / 释放”，让系统可以正常管理这些时钟的启停和功耗。
+	*/
 	rockchip_clk_unprotect();
 
 	return 0;

@@ -903,26 +903,50 @@ static void rockchip_drm_copy_mode_from_mode_set(struct drm_display_mode *mode,
 	mode->picture_aspect_ratio = set->picture_aspect_ratio;
 }
 
+/*
+	该函数是 Rockchip DRM 驱动实现「uboot→kernel 无缝开机 logo 显示」的核心接口，核心目标是：
+	在 DRM 驱动初始化阶段，解析设备树中预定义的显示配置，直接复用 uboot 
+	预加载到预留内存的开机 logo 图片，通过 DRM 原子模式设置框架渲染到屏幕，全程不重置显示硬件、
+	不黑屏闪屏，实现开机画面的无缝衔接。
+*/
 void rockchip_drm_show_logo(struct drm_device *drm_dev)
 {
+	/*
+		DRM 原子状态对象：state 用于存储本次 logo 显示的硬件配置；
+		old_state 用于备份初始硬件状态，显示失败时回滚，避免屏幕异常
+	*/
 	struct drm_atomic_state *state, *old_state;
 	struct device_node *np = drm_dev->dev->of_node;
 	struct drm_mode_config *mode_config = &drm_dev->mode_config;
 	struct rockchip_drm_private *private = drm_dev->dev_private;
 	struct device_node *root, *route;
+	/*
+		Rockchip 自定义显示模式集：set 存储有效显示通路的完整配置；unset 存储无效 / 未连接的显示通路配置
+	*/
 	struct rockchip_drm_mode_set *set, *tmp, *unset;
+	/* 内核链表头：分别存储有效、无效的显示模式集，后续批量处理 */
 	struct list_head mode_set_list;
 	struct list_head mode_unset_list;
 	unsigned int plane_mask = 0;
 	struct drm_crtc *crtc;
 	int ret, i;
 
+	/* 
+		从 DRM 设备的设备树节点中，查找名为route的子节点，
+		该节点是 Rockchip 定义的显示路由配置根节点，内部包含每个屏幕的 logo 显示参数、硬件通路配置。 
+	*/
 	root = of_get_child_by_name(np, "route");
 	if (!root) {
 		dev_warn(drm_dev->dev, "failed to parse resources for logo display\n");
 		return;
 	}
 
+	/*
+		调用init_loader_memory函数（同文件内实现），这是 logo 显示的核心前置步骤：
+		从设备树解析logo-memory-region/drm-logo预留内存区域（uboot 启动时已把 logo 图片加载到这段物理内存中）；
+		若启用了 IOMMU，会为这段内存做 1:1 的 IOVA→物理地址映射，让 VOP 硬件能直接访问 logo 数据；
+		把内存的物理地址、虚拟地址、大小等信息存入private->logo结构体，供后续创建帧缓冲使用。
+	*/
 	if (init_loader_memory(drm_dev)) {
 		dev_warn(drm_dev->dev, "failed to parse loader memory\n");
 		return;
@@ -931,6 +955,8 @@ void rockchip_drm_show_logo(struct drm_device *drm_dev)
 	INIT_LIST_HEAD(&mode_set_list);
 	INIT_LIST_HEAD(&mode_unset_list);
 	drm_modeset_lock_all(drm_dev);
+	/* 申请 DRM 原子状态对象，这是 DRM 原子模式设置的核心 
+	—— 所有硬件配置修改都先写入这个状态对象，验证无误后一次性提交给硬件，避免中途修改导致的屏幕异常 */
 	state = drm_atomic_state_alloc(drm_dev);
 	if (!state) {
 		dev_err(drm_dev->dev, "failed to alloc atomic state for logo display\n");
@@ -940,14 +966,27 @@ void rockchip_drm_show_logo(struct drm_device *drm_dev)
 
 	state->acquire_ctx = mode_config->acquire_ctx;
 
+	// 遍历route根节点下的所有子节点，每个子节点对应一个屏幕的显示通路（如 HDMI0、MIPI-DSI0）。
 	for_each_child_of_node(root, route) {
 		if (!of_device_is_available(route))
 			continue;
 
+		/*
+			1.解析该显示通路的硬件连接：找到对应的 CRTC（VOP）、Connector（HDMI/MIPI）；
+			2.解析 logo 参数：宽高、色深、内存偏移、显示模式（全屏 / 居中）；
+			3.基于 uboot 预留的 logo 内存，创建 DRM 帧缓冲对象set->fb，供后续显示使用。
+		*/
 		set = of_parse_display_resource(drm_dev, route);
 		if (!set)
 			continue;
 
+		/*
+			1.检测 Connector 的连接状态、获取支持的显示模式；
+			2.匹配设备树中配置的显示时序（分辨率、刷新率）；
+			3.配置 CRTC、Encoder、Connector 的绑定关系；
+			4.设置亮度、对比度、饱和度、过扫描等显示参数
+			释放帧缓冲，把该配置加入无效链表mode_unset_list；初始化成功：加入有效链表mode_set_list。
+		*/
 		if (setup_initial_state(drm_dev, state, set)) {
 			drm_framebuffer_put(set->fb);
 			INIT_LIST_HEAD(&set->head);
@@ -963,10 +1002,15 @@ void rockchip_drm_show_logo(struct drm_device *drm_dev)
 	 * the mode_unset_list store the unconnected route, if route's crtc
 	 * isn't used, we should close it.
 	 */
+	/*
+		这段代码的作用是清理无效显示通路，关闭未使用的 CRTC（VOP）硬件，
+		避免闲置硬件占用时钟、功耗，同时保护 uboot 的硬件状态。
+	*/
 	list_for_each_entry_safe(unset, tmp, &mode_unset_list, head) {
 		struct rockchip_drm_mode_set *tmp_set;
 		int find_used_crtc = 0;
 
+		// 若 CRTC 被有效通路占用（find_used_crtc=1）：不做处理，避免影响正常显示；
 		list_for_each_entry_safe(set, tmp_set, &mode_set_list, head) {
 			if (set->crtc == unset->crtc) {
 				find_used_crtc = 1;
@@ -988,20 +1032,26 @@ void rockchip_drm_show_logo(struct drm_device *drm_dev)
 			 * splice_mode flag in loader_protect().
 			 */
 			if (unset->hdisplay && unset->vdisplay) {
+				// 获取 CRTC 的原子状态，把设备树中的显示时序写入adjusted_mode
 				crtc_state = drm_atomic_get_crtc_state(state, crtc);
+				// 锁定 CRTC 的硬件状态，关闭过程中不重置 uboot 设置的时钟、电源域，避免闪屏；
 				if (crtc_state)
 					rockchip_drm_copy_mode_from_mode_set(&crtc_state->adjusted_mode,
 									     unset);
+				
 				if (priv->crtc_funcs[pipe] &&
 				    priv->crtc_funcs[pipe]->loader_protect)
 					priv->crtc_funcs[pipe]->loader_protect(crtc, true);
+				// 调用 Rockchip CRTC 的关闭接口，关闭闲置的 VOP 硬件
 				priv->crtc_funcs[pipe]->crtc_close(crtc);
+				// 解除锁定。
 				if (priv->crtc_funcs[pipe] &&
 				    priv->crtc_funcs[pipe]->loader_protect)
 					priv->crtc_funcs[pipe]->loader_protect(crtc, false);
 			}
 		}
 
+		// 最后从链表中删除该无效配置，释放内存。
 		list_del(&unset->head);
 		kfree(unset);
 	}
@@ -1017,8 +1067,13 @@ void rockchip_drm_show_logo(struct drm_device *drm_dev)
 	 * drm devices as old state, so if new state come, can compare
 	 * with this state to judge which status need to update.
 	 */
+	/* 
+		把之前初始化的原子状态，交换为 DRM 设备的当前硬件状态，让内核识别当前硬件的配置（继承 uboot 设置的状态）。
+	*/
 	WARN_ON(drm_atomic_helper_swap_state(state, false));
+	// 释放交换后的旧状态对象，减少内存占用。
 	drm_atomic_state_put(state);
+	// 复制一份当前硬件的原子状态，作为备份 —— 如果后续 logo 显示失败，直接恢复这个状态，避免屏幕异常。
 	old_state = drm_atomic_helper_duplicate_state(drm_dev,
 						      mode_config->acquire_ctx);
 	if (IS_ERR(old_state)) {
@@ -1027,6 +1082,7 @@ void rockchip_drm_show_logo(struct drm_device *drm_dev)
 		goto err_free_state;
 	}
 
+	// 再复制一份新的原子状态，用于后续 logo 显示的配置修改，避免直接修改当前硬件状态。
 	state = drm_atomic_helper_duplicate_state(drm_dev,
 						  mode_config->acquire_ctx);
 	if (IS_ERR(state)) {
@@ -1036,6 +1092,14 @@ void rockchip_drm_show_logo(struct drm_device *drm_dev)
 	}
 	state->acquire_ctx = mode_config->acquire_ctx;
 
+	/*
+		1. 遍历所有有效显示通路，调用update_state更新原子状态，完成 logo 显示的核心配置：
+		把 logo 帧缓冲set->fb绑定到 CRTC 的主图层（Primary Plane）；
+		配置图层的显示位置、宽高（全屏 / 居中）；
+		设置过扫描、色彩参数，更新 CRTC/Connector 的绑定关系；
+		把用到的图层标记到plane_mask，供后续资源清理。
+		2. 遍历所有 Connector，把未连接的屏幕的编码器置空，避免无效的硬件配置导致原子提交失败
+	*/
 	list_for_each_entry(set, &mode_set_list, head)
 		/*
 		 * We don't want to see any fail on update_state.
@@ -1048,12 +1112,21 @@ void rockchip_drm_show_logo(struct drm_device *drm_dev)
 			state->connectors[i].new_state->best_encoder = NULL;
 	}
 
+	/*
+		先验证原子状态中的所有硬件配置是否合法、无冲突；
+		验证通过后，一次性把所有配置提交给硬件，点亮屏幕显示 logo；
+		提交是原子性的：要么全部配置生效，要么全部不生效，不会出现中途异常导致的花屏、闪屏
+	*/
 	ret = drm_atomic_commit(state);
 	/**
 	 * todo
 	 * drm_atomic_clean_old_fb(drm_dev, plane_mask, ret);
 	 */
 
+	 /*
+	 	若配置了force-output强制输出，恢复 Connector 的强制输出状态为默认值，避免影响后续热插拔检测；
+		从链表中删除节点，释放rockchip_drm_mode_set结构体的内存
+	 */
 	list_for_each_entry_safe(set, tmp, &mode_set_list, head) {
 		if (set->force_output)
 			set->sub_dev->connector->force = DRM_FORCE_UNSPECIFIED;
@@ -1074,6 +1147,12 @@ void rockchip_drm_show_logo(struct drm_device *drm_dev)
 		goto err_free_state;
 	}
 
+	/* 
+		rockchip_free_loader_memory(drm_dev)：释放 uboot 预留的 logo 内存，包括解除 IOMMU 映射、释放物理内存、释放private->logo结构体，避免内存泄漏。
+		drm_atomic_state_put(old_state/state)：释放备份的和当前的原子状态对象，完成内存清理。
+		private->loader_protect = true：设置加载器保护标志为 true，告知驱动其他模块：当前显示状态继承自 uboot，不要随意重置硬件、时钟，保证后续 FBDEV / 应用显示的无缝衔接。
+		drm_modeset_unlock_all(drm_dev)：释放 DRM 模式设置的全局锁，开放硬件资源给后续模块使用。
+	*/
 	rockchip_free_loader_memory(drm_dev);
 	drm_atomic_state_put(old_state);
 	drm_atomic_state_put(state);
@@ -1081,6 +1160,12 @@ void rockchip_drm_show_logo(struct drm_device *drm_dev)
 	private->loader_protect = true;
 	drm_modeset_unlock_all(drm_dev);
 
+	/*
+		检查 FBDEV 辅助器和帧缓冲是否已初始化；
+		遍历所有 CRTC，检查对应输出接口是否支持热插拔（HDMI/DP 等）；
+		对支持热插拔的接口，调用drm_framebuffer_get增加 FBDEV 帧缓冲的引用计数，保证 FBDEV 初始化时，
+		直接复用当前的显示状态，不会重置屏幕，实现 logo 到控制台的无缝切换。
+	*/
 	if (private->fbdev_helper && private->fbdev_helper->fb) {
 		drm_for_each_crtc(crtc, drm_dev) {
 			struct rockchip_crtc_state *s = NULL;

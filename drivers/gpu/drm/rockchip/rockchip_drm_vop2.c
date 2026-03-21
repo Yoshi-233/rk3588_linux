@@ -3376,6 +3376,22 @@ static int vop2_wb_connector_init(struct vop2 *vop2, int nr_crtcs)
 	spin_lock_init(&vop2->wb.job_lock);
 	drm_connector_helper_add(&vop2->wb.conn.base, &vop2_wb_connector_helper_funcs);
 
+	/*
+		写回连接器（Writeback Connector）仅用于写回功能，不能同时支持显示输出 —— 
+		两者的硬件链路、DRM 角色完全不同，强行用写回连接器注册显示功能会导致冲突（如无法读取 EDID、显示时序配置失败）；
+		若硬件同时支持「写回 + 显示」，需分别注册两个独立的 Connector：
+		一个写回连接器（用于内存回写），一个标准显示连接器（HDMI/DP/MIPI，用于屏幕输出），两者通过不同的硬件端口和 DRM 配置实现功能隔离；
+		Rockchip 驱动中，HDMI/DP 等显示连接器的注册，
+		是在对应的子驱动（如 dw_hdmi_rockchip.c、cdn_dp.c）中独立完成的，与写回连接器的注册完全分离。
+
+		对比维度	写回连接器（vop2_wb_connector）						显示连接器（HDMI/DP/MIPI）
+		核心功能	将 VOP 合成画面回写到内存						将 VOP 合成画面输出到外部屏幕
+		连接对象	内存（帧缓冲）	               	 					物理显示器
+		DRM 类型标识	DRM_MODE_CONNECTOR_WRITEBACK（框架定义的写回专属类型）			 DRM_MODE_CONNECTOR_HDMI/DP/MIPI_DSI（显示专属类型）
+		关键回调实现	detect 强制返回 connected（无外部设备）；无 get_modes（无需读取 EDID）	   detect 读取 HPD 引脚检测设备；get_modes 读取 EDID 枚举分辨率
+		硬件链路	VOP → 写回模块 → AXI 总线 → 内存					VOP → Encoder（协议编码） → Connector（物理接口） → 显示器
+		属性配置	仅需配置回写格式、内存地址等						需配置 EDID、HDR 元数据、显示时序、热插拔等
+	*/
 	ret = drm_writeback_connector_init(vop2->drm_dev, &vop2->wb.conn,
 					   &vop2_wb_connector_funcs,
 					   &vop2_wb_encoder_helper_funcs,
@@ -3737,8 +3753,27 @@ static void vop2_attach_cubic_lut_prop(struct drm_crtc *crtc, unsigned int cubic
 	drm_object_attach_property(&crtc->base, private->cubic_lut_size_prop, cubic_lut_size);
 }
 
+/*
+	这个函数是瑞芯微 RK3588/RK3568/RK3528 等芯片 VOP2 显示驱动中，
+	3D 立方查找表（Cubic LUT）功能的核心初始化入口，属于 Linux DRM 显示框架的驱动层代码，
+	核心作用是为每个显示输出管道（VP 视频端口，对应 DRM 的 CRTC）初始化 3D LUT 硬件能力，
+	并向 DRM 框架注册对应的用户态配置属性，为专业色彩管理、HDR/SDR 色域转换、画质调校提供底层驱动支持。
+
+
+	特性		Cubic 3D LUT					   		 Gamma 一维 LUT
+	维度		三维 RGB 联合校正，可处理通道间的色彩交叉影响			     一维单通道独立校正，仅能处理单通道的非线性 gamma 曲线
+	核心能力	色域转换（sRGB↔BT.2020）、HDR 色调映射（HDR10/HLG/HDR Vivid）、
+			白平衡校正、专业色彩管理					   基础 gamma 曲线调整、亮度对比度校正
+	表项规格	通常 729 个表项（9x9x9）					   通常 1024 个表项 / 通道
+	硬件位置	显示管线的后级 HDR / 画质处理模块	 			    显示管线的前级像素输出模块
+*/
 static void vop2_cubic_lut_init(struct vop2 *vop2)
 {
+	/*
+		从芯片级 BSP 硬件描述中，获取每个 VP 支持的 3D LUT 表项长度；
+		为支持 3D LUT 的 CRTC，向 DRM 框架注册对应的配置属性，打通用户态到内核态的 3D LUT 配置链路；
+		完成 VP 运行时实例的 3D LUT 基础参数初始化，为后续原子提交、硬件写入做准备。
+	*/
 	const struct vop2_data *vop2_data = vop2->data;
 	const struct vop2_video_port_data *vp_data;
 	struct vop2_video_port *vp;
@@ -3751,6 +3786,11 @@ static void vop2_cubic_lut_init(struct vop2 *vop2)
 		if (!crtc->dev)
 			continue;
 		vp_data = &vop2_data->vp[vp->id];
+		// 9x9x9
+		/*
+			行业通用的 3D LUT 为9x9x9 规格，对应表项长度729（RGB 三个通道各 9 个采样点，9^3=729），
+			如 RK3588 的 VP0/VP1 就采用该规格；
+		*/
 		vp->cubic_lut_len = vp_data->cubic_lut_len;
 
 		if (vp->cubic_lut_len)
@@ -10886,8 +10926,18 @@ static struct drm_plane *vop2_cursor_plane_init(struct vop2_video_port *vp)
 	return cursor;
 }
 
+/* Gamma 校正功能初始化核心函数 */
 static int vop2_gamma_init(struct vop2 *vop2)
 {
+	/*
+		1. 硬件能力前置校验，无 Gamma 寄存器则直接退出
+		2. 遍历 VOP2 所有的 VP 视频端口（对应 DRM 的 CRTC）
+		3. 过滤无效 / 未启用的 VP，获取硬件预设的 Gamma LUT 长度
+		4. 为 VP 分配 Gamma LUT 的软件缓存内存
+		5. 生成默认的线性 Gamma 校正表（Gamma=1.0，无非线性校正）
+		6. 向 DRM 框架注册 CRTC 的 Gamma 能力，启用色彩管理接口
+		7. 把默认 Gamma 值同步到 DRM 框架的标准缓存中
+	*/
 	const struct vop2_data *vop2_data = vop2->data;
 	const struct vop2_video_port_data *vp_data;
 	struct vop2_video_port *vp;
@@ -10897,6 +10947,9 @@ static int vop2_gamma_init(struct vop2 *vop2)
 	int i = 0, j = 0;
 	u32 lut_len = 0;
 
+	/* 
+		vop2->lut_regs：Gamma LUT 硬件寄存器的基地址，在驱动 bind 阶段通过设备树的gamma_lut寄存器段映射得到。
+	*/
 	if (!vop2->lut_regs)
 		return 0;
 
@@ -10905,17 +10958,37 @@ static int vop2_gamma_init(struct vop2 *vop2)
 		crtc = &vp->rockchip_crtc.crtc;
 		if (!crtc->dev)
 			continue;
+		/*
+			vp_data：该 VP 对应的芯片级硬件固定参数（在 BSP 的vop2_reg.c中预定义），
+			包含 Gamma LUT 长度、最大分辨率、支持的硬件功能等。
+		*/
 		vp_data = &vop2_data->vp[vp->id];
+		// .gamma_lut_len = 1024,
+		/* 
+			.lut_dma_rid = 0xd, Gamma LUT 的 DMA 请求 ID，
+			VOP2 支持通过 DMA 方式将 Gamma 表批量写入硬件寄存器，
+			这里保存硬件分配的 DMA 通道 ID，用于后续 DMA 传输配置。
+		*/
 		lut_len = vp_data->gamma_lut_len;
 		if (!lut_len)
 			continue;
 		vp->gamma_lut_len = vp_data->gamma_lut_len;
 		vp->lut_dma_rid = vp_data->lut_dma_rid;
+		/*
+			内核带设备生命周期管理的内存分配函数，分配lut_len个u32大小的数组，作为 Gamma LUT 的软件缓存。
+			用devm_前缀的函数，会在设备解绑时自动释放内存，避免手动管理内存导致的泄漏。
+			每个表项用u32类型，是因为需要打包 R/G/B 三个通道的 Gamma 值到一个 32 位变量中，匹配硬件寄存器的位宽要求。
+		*/
 		vp->lut = devm_kmalloc_array(dev, lut_len, sizeof(*vp->lut),
 					     GFP_KERNEL);
 		if (!vp->lut)
 			return -ENOMEM;
 
+		/* 
+			R 通道：占 bit0~bit9，值为j（0~1023）；
+			G 通道：占 bit10~bit19，值为j << 10，即j * 1024；
+			B 通道：占 bit20~bit29，值为j << 20，即j * 1024 * 1024。
+		*/
 		for (j = 0; j < lut_len; j++) {
 			u32 b = j * lut_len * lut_len;
 			u32 g = j * lut_len;
@@ -10924,8 +10997,26 @@ static int vop2_gamma_init(struct vop2 *vop2)
 			vp->lut[j] = r | g | b;
 		}
 
+		/*
+			作用：设置 CRTC 支持的 Gamma LUT 表项数量，同时为 DRM 框架的crtc->gamma_store分配对应大小的软件缓存。
+			意义：告诉 DRM 框架，该显示控制器支持的 Gamma 精度，用户空间（Android SurfaceFlinger、Weston 等）
+			      可通过DRM_IOCTL_MODE_SETGAMMA ioctl 接口，设置自定义 Gamma 表。
+		*/
 		drm_mode_crtc_set_gamma_size(crtc, lut_len);
+		/*
+			作用：启用 CRTC 的色彩管理功能，向 DRM 框架声明硬件的色彩处理能力。
+			参数说明：
+			第 2 个参数degamma_lut_size=0：说明 VOP2 硬件不支持前端去 Gamma 校正；
+			第 3 个参数has_ctm=false：说明颜色转换矩阵（CTM）功能不在此启用，或硬件不支持；
+			第 4 个参数gamma_lut_size=lut_len：启用后端 Gamma 校正，表项长度与硬件匹配
+		*/
 		drm_crtc_enable_color_mgmt(crtc, 0, false, lut_len);
+		/*
+			crtc->gamma_store：DRM 框架维护的 Gamma 表标准缓存，是u16类型的数组，布局为：前lut_len个元素是 R 通道，中间lut_len个是 G 通道，最后lut_len个是 B 通道。
+			r_base/g_base/b_base：分别指向 R/G/B 三个通道缓存的起始地址。
+			rockchip_vop2_crtc_fb_gamma_get：瑞芯微自定义的工具函数，作用是从vp->lut的打包表项中，拆解出第j个表项的 R/G/B 三个通道的值，分别写入 DRM 框架的对应缓存中。
+			意义：保证驱动私有缓存与 DRM 框架缓存的默认值一致，用户空间读取 Gamma 表时，能拿到正确的线性默认值。
+		*/
 		r_base = crtc->gamma_store;
 		g_base = r_base + crtc->gamma_size;
 		b_base = g_base + crtc->gamma_size;

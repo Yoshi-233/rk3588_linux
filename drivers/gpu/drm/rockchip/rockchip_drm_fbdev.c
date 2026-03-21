@@ -124,7 +124,7 @@ int rockchip_drm_fbdev_init(struct drm_device *dev)
 	private->fbdev_helper = helper;
 
 	drm_fb_helper_prepare(dev, helper, &rockchip_drm_fb_helper_funcs);
-
+	// 内部会注册 fbdev 设备（生成 /dev/fb0）、关联 DRM 显示硬件
 	ret = drm_fb_helper_init(dev, helper);
 	if (ret < 0) {
 		DRM_DEV_ERROR(dev->dev,
@@ -132,7 +132,9 @@ int rockchip_drm_fbdev_init(struct drm_device *dev)
 			      ret);
 		return ret;
 	}
-
+	// 7. 设置默认硬件配置（关键：生成默认帧缓冲）
+    // PREFERRED_BPP：首选色深（通常 32 位，对应 ARGB8888）
+    // 内部会创建默认帧缓冲、设置显示模式（分辨率/刷新率）、绑定到 CRTC/Connector
 	ret = drm_fb_helper_initial_config(helper, PREFERRED_BPP);
 	if (ret < 0) {
 		DRM_DEV_ERROR(dev->dev,
