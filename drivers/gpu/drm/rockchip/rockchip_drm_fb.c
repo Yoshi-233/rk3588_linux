@@ -128,8 +128,18 @@ rockchip_drm_logo_fb_alloc(struct drm_device *dev, const struct drm_mode_fb_cmd2
 		return ERR_PTR(-ENOMEM);
 	fb = &rockchip_logo_fb->fb;
 
+	/* 
+		这是 DRM 框架提供的辅助函数，将 mode_cmd 中的显示参数（宽、高、像素格式、行间距 pitch、偏移量等）
+		自动填充到 fb 结构体的对应字段，完成标准帧缓冲的基础初始化，避免手动赋值出错。
+	*/
 	drm_helper_mode_fill_fb_struct(dev, fb, mode_cmd);
 
+	/*
+		核心初始化：调用 DRM 核心函数 drm_framebuffer_init，将 fb 注册到 DRM 子系统，
+			并绑定自定义的 rockchip_drm_fb_funcs 回调函数集（包含 destroy、create_handle 等）。
+		回调绑定的意义：通过 rockchip_drm_fb_funcs，Logo 帧缓冲的销毁、Handle 
+			创建等操作会走 Rockchip 定制的流程（如延迟销毁、禁止用户态映射），区别于普通帧缓冲。
+	*/
 	ret = drm_framebuffer_init(dev, fb, &rockchip_drm_fb_funcs);
 	if (ret) {
 		DRM_DEV_ERROR(dev->dev,
@@ -139,6 +149,18 @@ rockchip_drm_logo_fb_alloc(struct drm_device *dev, const struct drm_mode_fb_cmd2
 		return ERR_PTR(ret);
 	}
 
+	/*
+		GEM 对象的作用：DRM 框架通过 GEM（Graphics Execution Manager）对象管理图形内存，
+			即使 Logo 内存是预留在 reserved-memory 中的，也需要封装成 GEM 对象才能被 DRM 框架识别。
+		关联 GEM 对象：fb.obj[0] 指向自定义 GEM 对象 rk_obj 的基类（struct drm_gem_object），
+			因为 Logo 是单平面显示，所以只需要 obj[0]。
+		初始化 GEM 对象：drm_gem_object_init 初始化 GEM 对象的核心字段，
+			设置大小为页对齐后的 Logo 大小，符合 DRM GEM 框架的内存管理要求。
+		绑定内存地址：
+		rk_obj.dma_addr = logo->dma_addr：设置 DMA/IOMMU 地址（VOP 显示硬件访问的地址）。
+		rk_obj.kvaddr = logo->kvaddr：设置内核虚拟地址（CPU 读写 Logo 数据的地址）。
+		至此，GEM 对象完全关联到了之前预留的 Logo 物理内存，DRM 框架可以通过 GEM 对象访问 Logo 数据。
+	*/
 	fb->flags |= ROCKCHIP_DRM_MODE_LOGO_FB;
 	rockchip_logo_fb->logo = logo;
 	rockchip_logo_fb->fb.obj[0] = &rockchip_logo_fb->rk_obj.base;

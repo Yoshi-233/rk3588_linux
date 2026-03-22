@@ -60,6 +60,42 @@ find_sub_dev_by_node(struct drm_device *drm_dev, struct device_node *node)
 	struct device_node *np_connector;
 	struct rockchip_drm_sub_dev *sub_dev;
 
+	/*
+		结合你的 DTS 举例说明：
+			假设传入的 node 是 vp1_out_dp1 节点（即 &vp1 下的 endpoint@3）：
+			node：vp1_out_dp1（VP1 的输出端点）。
+			remote-endpoint：vp1_out_dp1 指向 &dp1_in_vp1（DP1 的输入端点）。
+		of_graph_get_remote_port_parent 的执行路径：
+			第一步：找到 remote-endpoint 对应的节点 dp1_in_vp1。
+			第二步：找到 dp1_in_vp1 所在的父节点 port@0（DP1 节点下的 ports 中的 port@0）。
+			第三步：找到 port@0 的父节点，即 dp1 节点（物理 DP1 控制器的设备树节点）。
+			结果：np_connector 最终指向 dp1 节点。
+
+		&display_subsystem {
+			route {
+				route_dp1: route-dp1 {
+				connect = <&vp1_out_dp1>; // 1. 显示路由指向 VP1 的输出端点
+				};
+			};
+		};
+
+		&vp1 {
+			vp1_out_dp1: endpoint@3 {           // 2. VP1 的输出端点
+				remote-endpoint = <&dp1_in_vp1>; // 3. 指向 DP1 的输入端点
+			};
+		};
+
+		dp1: dp@fde60000 {
+			status = "disabled"; // 【注意】这里必须改为 okay 函数才能成功
+			ports {
+				port@0 {
+					dp1_in_vp1: endpoint@1 {      // 4. DP1 的输入端点
+						remote-endpoint = <&vp1_out_dp1>; // 5. 反向指向 VP1
+					};
+				};
+			};
+		};
+	*/
 	np_connector = of_graph_get_remote_port_parent(node);
 	if (!np_connector || !of_device_is_available(np_connector))
 		return NULL;
@@ -71,23 +107,84 @@ find_sub_dev_by_node(struct drm_device *drm_dev, struct device_node *node)
 	return sub_dev;
 }
 
+/*
+	直连拓扑：VP（显示控制器）直接连接 DP/HDMI 等物理输出接口（find_sub_dev_by_node 处理）。
+	桥接拓扑：VP 通过中间 Bridge（如 LVDS 转换芯片、DSI 转 HDMI 芯片）
+		连接最终的显示接口 / 面板（find_sub_dev_by_bridge 处理）。
+*/
 static struct rockchip_drm_sub_dev *
 find_sub_dev_by_bridge(struct drm_device *drm_dev, struct device_node *node)
 {
+	/*
+		&vp1 {
+			vp1_out_lvds: endpoint@5 {           // 【1】传入的 node 是这个
+				remote-endpoint = <&lvds_bridge_in>; // 【2】指向 Bridge 的输入
+			};
+		};
+
+		lvds_bridge: bridge@10000000 {              // 【3】np_encoder 指向这里
+			status = "okay";
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				port@0 {                           // Bridge 的输入端口（接 VP）
+					reg = <0>;
+					lvds_bridge_in: endpoint@0 {
+						remote-endpoint = <&vp1_out_lvds>;
+					};
+				};
+				port@1 {                           // 【4】port 指向这里（Bridge 的输出端口）
+					reg = <1>;
+					lvds_bridge_out: endpoint@0 {
+						remote-endpoint = <&panel_in>; // 【5】指向 Panel 的输入
+					};
+				};
+			};
+		};
+
+		panel: panel@0 {                            // 【6】np_connector 最终指向这里
+			status = "okay";
+			port {
+				panel_in: endpoint@0 {
+				remote-endpoint = <&lvds_bridge_out>;
+				};
+			};
+		};
+	*/
 	struct device_node *np_encoder, *np_connector = NULL;
 	struct rockchip_drm_sub_dev *sub_dev = NULL;
 	struct device_node *port, *endpoint;
 
+	/*
+		传入的 node：和 find_sub_dev_by_node 一样，是 VP 的 output endpoint（比如 vp1_out_lvds）。
+		of_graph_get_remote_port_parent(node)：
+		从 VP 的 endpoint 出发，通过 remote-endpoint 找到 Bridge 的 input endpoint。
+		再向上找到父节点，即 Bridge 的设备树节点（比如 lvds_bridge 或 dsi2hdmi_bridge）。
+	*/
 	np_encoder = of_graph_get_remote_port_parent(node);
 	if (!np_encoder || !of_device_is_available(np_encoder))
 		goto err_put_encoder;
 
+	/*
+		Bridge 的双端口设计：
+		Bridge 通常有两个 port：
+			port@0：输入端口（接 VP 的输出）。
+			port@1：输出端口（接最终的 Connector/Panel）。
+			of_graph_get_port_by_id(np_encoder, 1)：
+		明确获取 Bridge 的 port@1（输出端口），因为我们要找 Bridge 后面连接的设备。
+		如果找不到 port@1，说明 Bridge 的设备树配置缺失，打印错误并跳
+	*/
 	port = of_graph_get_port_by_id(np_encoder, 1);
 	if (!port) {
 		dev_err(drm_dev->dev, "can't found port point!\n");
 		goto err_put_encoder;
 	}
 
+	/*
+		对每个 endpoint，调用 of_graph_get_remote_port_parent(endpoint)：
+		从 Bridge 的 output endpoint 出发，通过 remote-endpoint 找到最终 Connector/Panel 的 input endpoint。
+		再向上找到父节点，即 最终的 Connector/Panel 设备树节点（比如 lvds_panel 或 hdmi_connector）
+	*/
 	for_each_child_of_node(port, endpoint) {
 		np_connector = of_graph_get_remote_port_parent(endpoint);
 		if (!np_connector) {
@@ -130,7 +227,7 @@ static void rockchip_drm_release_reserve_vm(struct drm_device *drm, struct drm_m
 		drm_mm_remove_node(node);
 	mutex_unlock(&private->mm_lock);
 }
-
+// 在 DRM 驱动的 IOMMU 地址空间中，预留一段用户指定起始地址、固定大小的 IOVA（IO 虚拟地址）区间，
 static int rockchip_drm_reserve_vm(struct drm_device *drm, struct drm_mm *mm,
 				   struct drm_mm_node *node, u64 size, u64 offset)
 {
@@ -141,6 +238,18 @@ static int rockchip_drm_reserve_vm(struct drm_device *drm, struct drm_mm *mm,
 	node->start = offset;
 	node->color = 0;
 	mutex_lock(&private->mm_lock);
+	/*
+		强制预留用户指定起始地址、指定大小的连续地址区间
+		描述地址区间的节点结构体，用户必须提前初始化node->start（起始地址）
+		和node->size（区间大小），其余字段由函数内部填充
+		特性		drm_mm_reserve_node				drm_mm_insert_node
+		地址选择	用户完全指定起始地址和大小，分配器仅做校验预留	     分配器自动寻找符合大小、对齐要求的空闲块，用户无法指定起始地址
+		核心用途	固定地址预留、1:1 映射、硬件固定地址要求	    通用地址分配，如普通 DMA 缓冲区、图层 IOVA 分配
+		失败触发条件	指定的地址已被占用、越界，即失败		    整个地址空间无符合要求的连续空闲块，才会失败
+		
+		在开机 logo 场景中，必须使用drm_mm_reserve_node，因为只有它能固定 IOVA 的起始地址，
+		实现和物理地址的 1:1 对等映射，这是自动分配地址的drm_mm_insert_node做不到的。
+	*/
 	ret = drm_mm_reserve_node(mm, node);
 	mutex_unlock(&private->mm_lock);
 
@@ -212,6 +321,11 @@ void rockchip_free_loader_memory(struct drm_device *drm)
 	private->loader_protect = false;
 }
 
+/*
+	解析设备树中预分配的开机 logo 和颜色查找表（Cubic LUT）预留内存，完成内核虚拟地址映射、
+	IOMMU 1:1 地址映射，封装成驱动可识别的 logo 资源结构体，让内核 DRM 驱动可以直接复用 
+	uboot 预加载到这段内存的开机 logo 图片数据，全程不重置显示硬件、不黑屏闪屏，实现开机画面的无缝衔接。
+*/
 static int init_loader_memory(struct drm_device *drm_dev)
 {
 	struct rockchip_drm_private *private = drm_dev->dev_private;
@@ -223,14 +337,21 @@ static int init_loader_memory(struct drm_device *drm_dev)
 	struct resource res;
 	int ret, idx;
 
+	// 优先通过memory-region-names匹配名为drm-logo的预留内存区域
 	idx = of_property_match_string(np, "memory-region-names", "drm-logo");
 	if (idx >= 0)
 		node = of_parse_phandle(np, "memory-region", idx);
 	else
+		// 匹配不到则兼容旧写法，直接获取logo-memory-region指向的第一个内存节点，保证不同版本设备树的兼容性
 		node = of_parse_phandle(np, "logo-memory-region", 0);
 	if (!node)
 		return -ENOMEM;
-
+	/*
+		private->domain是 Rockchip DRM 驱动的 IOMMU 域，
+			若平台启用 IOMMU（RK3588 等高端芯片默认启用），则重新计算pg_size为 IOMMU 支持的最小页大小。
+		__ffs(private->domain->pgsize_bitmap)：找到 IOMMU 页大小位图中最低位的 1，
+			即 IOMMU 支持的最小页尺寸，满足硬件 MMU 的地址对齐要求。
+	*/
 	ret = of_address_to_resource(node, 0, &res);
 	if (ret)
 		return ret;
@@ -240,6 +361,12 @@ static int init_loader_memory(struct drm_device *drm_dev)
 	size = resource_size(&res);
 	if (!size)
 		return -ENOMEM;
+	/*
+		强制校验内核页对齐：即使 IOMMU 页大小更大，也要求预留内存的起始地址和大小必须对齐到PAGE_SIZE，
+			否则打印 ERROR 日志 ——Linux 内核内存管理以PAGE_SIZE为最小单位，不对齐会导致内存访问异常。
+		页大小不匹配警告：若 IOMMU 页大小与内核页大小不一致，
+			打印 WARN 日志提醒映射效率问题，但不终止流程，保证兼容性。
+	*/
 	if (!IS_ALIGNED(res.start, PAGE_SIZE) || !IS_ALIGNED(size, PAGE_SIZE))
 		DRM_ERROR("Reserved logo memory should be aligned as:0x%lx, cureent is:start[%pad] size[%pad]\n",
 			  PAGE_SIZE, &res.start, &size);
@@ -252,10 +379,30 @@ static int init_loader_memory(struct drm_device *drm_dev)
 
 	logo->kvaddr = phys_to_virt(start);
 
+	/*
+		IOMMU 1:1 映射（核心逻辑，启用 IOMMU 时执行）：
+			第一步：rockchip_drm_reserve_vm在 DRM 驱动的 IOMMU 地址空间（private->mm）中，
+				预留一段和物理内存大小、起始地址完全一致的 IOVA（I/O 虚拟地址）区间，为 1:1 映射做准备。
+			第二步：iommu_map执行 IOMMU 1:1 地址映射，将 IOVA 地址start映射到物理地址start，
+				映射长度按 IOMMU 页大小对齐，权限设置为可读可写。
+			1:1 映射的核心意义：uboot 中未启用 IOMMU，VOP 显示硬件直接访问 logo 的物理地址；
+				kernel 启用 IOMMU 后，VOP 只能访问 IOVA 地址。1:1 映射让 VOP 在 kernel 
+				中可以继续使用和 uboot 完全一致的地址访问 logo 数据，不需要修改 VOP 硬件寄存器配置，
+				保证显示硬件不中断，实现无缝无闪屏的开机画面。
+			若 IOMMU 映射失败，跳转到err_free_logo错误处理分支，释放已分配资源，避免内存泄漏。
+	*/
 	if (private->domain) {
 		ret = rockchip_drm_reserve_vm(drm_dev, &private->mm, &logo->logo_reserved_node, size, start);
 		if (ret)
 			dev_err(drm_dev->dev, "failed to reserve vm for logo memory\n");
+		/*
+			1:1 映射的作用
+			如果我们在 Kernel 中把 IOVA 设置成和物理地址完全一样（即 iova = paddr = start），那么：
+			硬件寄存器无需修改：VOP 还在使用 Uboot 阶段设置的那个 “物理地址”，
+				但在 Kernel 启用 IOMMU 后，这个地址实际上变成了 IOVA，通过 IOMMU 映射又指回了原来的物理内存。
+			显示不中断：因为硬件配置没变，VOP 会继续扫描原来的内存区域，屏幕不会出现黑屏或闪屏，
+				直到 Kernel 驱动接管并更新画面。
+		*/
 		ret = iommu_map(private->domain, start, start, ALIGN(size, pg_size),
 				IOMMU_WRITE | IOMMU_READ);
 		if (ret) {
@@ -264,12 +411,21 @@ static int init_loader_memory(struct drm_device *drm_dev)
 		}
 	}
 
+	/*
+		dma_addr：DMA/IOMMU 地址，VOP 硬件访问的地址，启用 IOMMU 时是 IOVA，未启用时是物理地址。
+		start/size：预留内存的原始物理起始地址和总大小。
+		count：引用计数，初始化为 1，保证内存释放时只有引用计数为 0 才真正释放，避免并发访问的 UAF 问题。
+	*/
 	logo->dma_addr = start;
 	logo->start = res.start;
 	logo->size = size;
 	logo->count = 1;
 	private->logo = logo;
 
+	/*
+		可选功能兼容处理：Cubic LUT（三次颜色查找表）是 Rockchip 显示硬件的色彩校正功能，用于调整显示伽马、色彩曲线
+		，属于可选配置。若设备树中没有drm-cubic-lut预留内存，直接返回 0，不影响核心 logo 显示功能。
+	*/
 	idx = of_property_match_string(np, "memory-region-names", "drm-cubic-lut");
 	if (idx < 0)
 		return 0;
@@ -654,6 +810,12 @@ static int setup_initial_state(struct drm_device *drm_dev,
 	if (!set->hdisplay || !set->vdisplay || !set->vrefresh)
 		is_crtc_enabled = false;
 
+	/*
+		crtc->state->state = state：将 CRTC 当前状态的 state 指针指向传入的原子状态对象，
+			确保状态变更关联到本次事务。
+		drm_atomic_get_connector_state：从原子状态对象中获取 Connector 的状态对象 conn_state，
+			后续对 Connector 的配置（如绑定 Encoder、设置亮度）都写入该对象。
+	*/
 	crtc->state->state = state;
 
 	conn_state = drm_atomic_get_connector_state(state, connector);
@@ -662,11 +824,22 @@ static int setup_initial_state(struct drm_device *drm_dev,
 
 	funcs = connector->helper_private;
 
+	/*
+		如果 Connector 实现了 best_encoder 回调，
+			则调用它选择最佳的 Encoder（处理多 Encoder 场景）。
+		否则调用 rockchip_drm_connector_get_single_encoder，
+			直接获取唯一可用的 Encoder（Rockchip 大部分场景是一对一连接）
+	*/
 	if (funcs->best_encoder)
 		conn_state->best_encoder = funcs->best_encoder(connector);
 	else
 		conn_state->best_encoder = rockchip_drm_connector_get_single_encoder(connector);
 
+	/*
+		传入 true 表示锁定硬件状态，告诉 Encoder/Connector 驱动：
+			“当前硬件状态是 U-Boot 设置好的，不要重置时钟、电源域、PHY，避免闪屏”。
+		通常该回调会禁止硬件复位、保持时钟使能。
+	*/
 	if (set->sub_dev->loader_protect) {
 		ret = set->sub_dev->loader_protect(conn_state->best_encoder, true);
 		if (ret) {
@@ -677,6 +850,12 @@ static int setup_initial_state(struct drm_device *drm_dev,
 		}
 	}
 
+	/*
+		检测 Connector 的连接状态（如 HDMI 热插拔）。
+		通过 EDID 或强制配置获取 Connector 支持的所有显示模式，存入 connector->modes 链表。
+		7680, 7680 是最大支持的分辨率（8K 级别）。
+		set->force_output 表示是否强制输出（即使未检测到显示设备）
+	*/
 	num_modes = rockchip_drm_fill_connector_modes(connector, 7680, 7680, set->force_output);
 	if (!num_modes) {
 		dev_err(drm_dev->dev, "connector[%s] can't found any modes\n",
@@ -685,6 +864,16 @@ static int setup_initial_state(struct drm_device *drm_dev,
 		goto error_conn;
 	}
 
+	/*
+		遍历模式链表：逐个比较 Connector 支持的模式和 set 中从设备树（U-Boot 传递）解析的模式。
+		严格匹配的参数：
+			clock：像素时钟。
+			hdisplay/vdisplay：有效分辨率。
+			crtc_hsync_end/crtc_vsync_end：同步信号结束位置。
+			vrefresh：刷新率。
+			flags：显示模式标志（如隔行扫描、极性）。
+			picture_aspect_ratio：画面宽高比。
+	*/
 	list_for_each_entry(mode, &connector->modes, head) {
 		if (mode->clock == set->clock &&
 		    mode->hdisplay == set->hdisplay &&
@@ -723,6 +912,17 @@ static int setup_initial_state(struct drm_device *drm_dev,
 	conn_state->tv.saturation = set->saturation;
 	conn_state->tv.hue = set->hue;
 	set->mode = mode;
+	/*
+		获取 CRTC 状态：drm_atomic_get_crtc_state 获取 CRTC 的原子状态对象 crtc_state。
+		复制调整后的模式：将匹配的模式复制到 crtc_state->adjusted_mode。
+		模式变更判断：
+			如果 !match（模式不匹配）或 !is_crtc_enabled（CRTC 未使能），设置 mode_changed = true，表示后续需要重新设置模式。
+			否则（无缝场景）：
+				绑定 Connector 到 CRTC：drm_atomic_set_crtc_for_connector。
+				设置 CRTC 模式：drm_atomic_set_mode_for_crtc，将匹配的模式写入 CRTC 状态。
+				激活 CRTC：crtc_state->active = true。
+				CRTC 级 Loader Protect：调用 CRTC 的 loader_protect(true)，锁定 CRTC 硬件状态（如 VOP 时钟、电源域），避免重置。
+	*/
 	crtc_state = drm_atomic_get_crtc_state(state, crtc);
 	if (IS_ERR(crtc_state)) {
 		ret = PTR_ERR(crtc_state);
@@ -753,6 +953,7 @@ static int setup_initial_state(struct drm_device *drm_dev,
 		ret = 0;
 		goto error_crtc;
 	}
+	// plane state
 	primary_state = drm_atomic_get_plane_state(state, crtc->primary);
 	if (IS_ERR(primary_state)) {
 		ret = PTR_ERR(primary_state);
