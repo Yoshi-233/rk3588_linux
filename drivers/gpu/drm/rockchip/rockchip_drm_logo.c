@@ -1027,13 +1027,31 @@ static int update_state(struct drm_device *drm_dev,
 	conn_state = drm_atomic_get_connector_state(state, connector);
 	if (IS_ERR(conn_state))
 		return PTR_ERR(conn_state);
+	/* 
+		Rockchip 的容器宏，从标准drm_crtc_state中，
+		提取厂商扩展的私有状态结构体rockchip_crtc_state
+		（标准 DRM 不支持过扫描等厂商自定义功能，必须扩展）。 
+	*/
 	s = to_rockchip_crtc_state(crtc_state);
 	s->left_margin = set->left_margin;
 	s->right_margin = set->right_margin;
 	s->top_margin = set->top_margin;
 	s->bottom_margin = set->bottom_margin;
 
+	/*
+		mode_changed = true：uboot 设置的显示模式和 kernel 检测到的屏幕模式不匹配 / CRTC 未使能，
+			需要 kernel 重新设置显示时序（兜底场景，可能有闪屏）；
+		mode_changed = false：uboot 和 kernel 的显示模式完全匹配，
+			可直接继承 uboot 的硬件状态，不重置硬件，实现无缝无闪屏显示。
+	*/
 	if (set->mode_changed) {
+		/*
+			drm_atomic_set_crtc_for_connector：把显示接口 Connector 和显示控制器 CRTC 做绑定，
+				写入原子状态，告诉 DRM 框架：这个接口要用这个 VOP 输出数据。
+			drm_atomic_set_mode_for_crtc：把和 uboot 一致的显示时序，写入 CRTC 状态，
+				配置分辨率、刷新率、像素时钟等所有时序参数。
+			crtc_state->active = true：把 CRTC 设置为激活状态，开启输出
+		*/
 		ret = drm_atomic_set_crtc_for_connector(conn_state, crtc);
 		if (ret)
 			return ret;
@@ -1044,11 +1062,22 @@ static int update_state(struct drm_device *drm_dev,
 
 		crtc_state->active = true;
 	} else {
+		/*
+			标准的drm_atomic_set_mode_for_crtc会触发硬件全量重置（包括时钟、PHY、电源域），直接导致屏幕黑屏闪屏。
+			而这个分支的核心目标是：完全继承 uboot 的硬件状态，只做最小化的状态同步，不触发任何硬件重置，保证画面全程持续输出。
+		*/
 		const struct drm_encoder_helper_funcs *encoder_helper_funcs;
 		const struct drm_connector_helper_funcs *connector_helper_funcs;
 		struct drm_encoder *encoder;
 		struct drm_bridge *bridge;
 
+		/*
+			获取 Encoder：Encoder 是 CRTC 和 Connector 之间的桥梁，
+			负责把 CRTC 输出的像素数据，转换成对应接口的物理信号（如 HDMI 的 TMDS 信号）。
+			优先用 Connector 的best_encoder回调获取最佳 Encoder，
+			否则调用自定义接口获取唯一可用的 Encoder（Rockchip 平台大多是一个 
+			Connector 对应一个 Encoder，一对一绑定）。
+		*/
 		connector_helper_funcs = connector->helper_private;
 		if (!connector_helper_funcs)
 			return -ENXIO;
@@ -1061,18 +1090,31 @@ static int update_state(struct drm_device *drm_dev,
 		encoder_helper_funcs = encoder->helper_private;
 		if (!encoder_helper_funcs->atomic_check)
 			return -ENXIO;
+		/* 
+			原子合法性检查：调用 Encoder 的atomic_check回调，检查当前 CRTC/Connector 状态是否合法、
+			有无硬件冲突，这是 DRM 原子框架的强制要求，先检查再配置，避免硬件异常。
+		*/
 		ret = encoder_helper_funcs->atomic_check(encoder, crtc->state,
 							 conn_state);
 		if (ret)
 			return ret;
 
+		/*
+			Encoder 最小化模式配置：优先调用原子版atomic_mode_set，无实现则调用传统mode_set。核心要点：
+			只传入和 uboot 完全一致的显示时序，让 Encoder 驱动只做状态同步，不关闭时钟 / PHY、不重置硬件，保证显示不中断。
+		*/
 		if (encoder_helper_funcs->atomic_mode_set)
 			encoder_helper_funcs->atomic_mode_set(encoder,
 							      crtc_state,
 							      conn_state);
 		else if (encoder_helper_funcs->mode_set)
 			encoder_helper_funcs->mode_set(encoder, mode, mode);
-
+		
+		/*
+			Bridge 链状态同步：获取 Encoder 上挂载的 Bridge 芯片（如 DSI 转 HDMI、LVDS 转换芯片），
+			调用drm_bridge_chain_mode_set给整个 Bridge 链设置相同的时序。
+			同样只做状态同步，不重置桥接芯片，保证桥接链路的输出持续稳定。
+		*/
 		bridge = drm_bridge_chain_get_first_bridge(encoder);
 		drm_bridge_chain_mode_set(bridge, mode, mode);
 	}
@@ -1081,10 +1123,25 @@ static int update_state(struct drm_device *drm_dev,
 	if (IS_ERR(primary_state))
 		return PTR_ERR(primary_state);
 
+	/*
+		plane_mask的每一位对应一个图层，把主图层的对应位设为 1，
+		告诉 CRTC 本次要启用这个主图层；同时把掩码写入输出参数plane_mask，
+		供后续资源清理、旧帧缓冲释放使用。
+	*/
 	crtc_state->plane_mask = 1 << drm_plane_index(crtc->primary);
 	*plane_mask |= crtc_state->plane_mask;
 
-
+	/*
+		绑定 logo 帧缓冲到图层：drm_atomic_set_fb_for_plane把set->fb
+			基于 uboot 预留内存创建的 logo 帧缓冲，绑定到主图层。
+			这一步的核心意义是：告诉 DRM 框架，
+			这个图层要显示的画面数据，就存在 uboot 预加载 logo 的内存里。
+		释放帧缓冲引用：drm_framebuffer_put减少帧缓冲的引用计数。
+			因为绑定操作已经增加了引用，这里释放创建时的引用，
+			避免内存泄漏，让 DRM 框架自动管理帧缓冲生命周期。
+		绑定图层到 CRTC：drm_atomic_set_crtc_for_plane把主图层和 CRTC 绑定，
+			告诉 DRM 框架：这个图层由这个 VOP 驱动输出。
+	*/
 	drm_atomic_set_fb_for_plane(primary_state, set->fb);
 	drm_framebuffer_put(set->fb);
 	ret = drm_atomic_set_crtc_for_plane(primary_state, crtc);

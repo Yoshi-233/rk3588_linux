@@ -1997,21 +1997,44 @@ static struct dma_buf *rockchip_drm_gem_prime_export(struct drm_gem_object *obj,
 }
 
 static struct drm_driver rockchip_drm_driver = {
+	/*
+		DRIVER_MODESET：支持模式设置（Mode Setting），即可以修改分辨率、刷新率、显示时序等。
+		DRIVER_GEM：支持GEM（Graphics Execution Manager），即内核级的图形内存管理（分配、释放、映射显存）。
+		DRIVER_ATOMIC：支持原子模式设置（Atomic Mode Setting），即 “要么所有配置同时生效，
+			要么都不生效”，避免显示撕裂 / 闪烁。
+		DRIVER_RENDER：支持渲染节点（Render Node），允许用户空间直接访问 GPU 进行渲染
+			（Rockchip 这里主要用于 GPU 与显示的内存共享）。
+	*/
 	.driver_features	= DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC | DRIVER_RENDER,
+	/* 清理未完成的 VBlank（垂直消隐）事件，防止资源泄漏。 */
 	.postclose		= rockchip_drm_postclose,
+	/* 如果没有显示 Logo，恢复 fbdev（Framebuffer Device）控制台（让内核可以继续显示日志）。 */
 	.lastclose		= rockchip_drm_lastclose,
+	/* 初始化打开上下文，清空主图层的帧缓冲（避免遗留垃圾数据） */
 	.open			= rockchip_drm_open,
+	/* 使用 CMA（Contiguous Memory Allocator） 管理显存，保证物理地址连续（Rockchip 显示硬件需要连续内存） */
 	.gem_vm_ops		= &drm_gem_cma_vm_ops,
+	/* 释放 GEM 对象对应的物理内存和虚拟地址映射。 */
 	.gem_free_object_unlocked = rockchip_gem_free_object,
+	/* 创建 “哑缓冲”（Dumb Buffer）—— 一种简单的、不需要 GPU 参与的帧缓冲，常用于显示桌面或 Logo。 */
 	.dumb_create		= rockchip_gem_dumb_create,
+	/* GEM 句柄转 DMA-BUF 文件描述符 */
 	.prime_handle_to_fd	= drm_gem_prime_handle_to_fd,
+	/* DMA-BUF 文件描述符转 GEM 句柄 */
 	.prime_fd_to_handle	= drm_gem_prime_fd_to_handle,
+	/* 导入 DMA-BUF 为 GEM 对象 */
 	.gem_prime_import	= rockchip_drm_gem_prime_import,
+	/* 导出 GEM 对象为 DMA-BUF */
 	.gem_prime_export	= rockchip_drm_gem_prime_export,
+	/* 获取 GEM 的散列表（用于 DMA 映射） */
 	.gem_prime_get_sg_table	= rockchip_gem_prime_get_sg_table,
+	/* 从散列表导入 GEM */
 	.gem_prime_import_sg_table	= rockchip_gem_prime_import_sg_table,
+	/* 映射 GEM 到内核虚拟地址 */
 	.gem_prime_vmap		= rockchip_gem_prime_vmap,
+	/* 取消内核虚拟地址映射 */
 	.gem_prime_vunmap	= rockchip_gem_prime_vunmap,
+	/* 映射 GEM 到用户虚拟地址 */
 	.gem_prime_mmap		= rockchip_gem_mmap_buf,
 #ifdef CONFIG_DEBUG_FS
 	.debugfs_init		= rockchip_drm_debugfs_init,
