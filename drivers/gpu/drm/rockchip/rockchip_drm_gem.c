@@ -419,6 +419,7 @@ static inline bool is_vop_enabled(void)
 	return (IS_ENABLED(CONFIG_ROCKCHIP_VOP) || IS_ENABLED(CONFIG_ROCKCHIP_VOP2));
 }
 
+/* 真正完成图形缓冲区的物理内存分配、内核虚拟地址映射、IOMMU 外设地址映射、硬件访问就绪准备 */
 static int rockchip_gem_alloc_buf(struct rockchip_gem_object *rk_obj,
 				  bool alloc_kmap)
 {
@@ -427,10 +428,33 @@ static int rockchip_gem_alloc_buf(struct rockchip_gem_object *rk_obj,
 	struct rockchip_drm_private *private = drm->dev_private;
 	int ret = 0;
 
+	/*
+		1.!private->domain：平台未开启 IOMMU，同时is_vop_enabled()为真
+			（内核编译了 VOP/VOP2 显示控制器驱动），此时显示控制器没有
+			 IOMMU 的地址翻译能力，只能访问物理地址连续的内存。
+		2.强制给rk_obj->flags加上ROCKCHIP_BO_CONTIG标志，无论用户是否传入该标志，
+			都强制走连续内存分配路径，避免显示控制器访问内存失败导致黑屏。
+		3.is_vop_enabled()：仅当显示控制器驱动开启时才强制连续内存，纯 GPU 渲染场景无需该限制。
+	*/
 	if (!private->domain && is_vop_enabled())
 		rk_obj->flags |= ROCKCHIP_BO_CONTIG;
 
 	if (rk_obj->flags & ROCKCHIP_BO_SECURE) {
+		/*
+			触发条件：用户传入的 flags 设置了ROCKCHIP_BO_SECURE，
+				用于 DRM 数字版权保护、高清付费内容、安全生物识别的安全显示场景。
+			逐行逻辑：
+			1. rk_obj->buf_type = ROCKCHIP_GEM_BUF_TYPE_SECURE：标记 buffer 类型为安全内存，
+				后续释放、映射都会走安全内存专属逻辑。
+			2. rk_obj->flags |= ROCKCHIP_BO_CONTIG：安全内存必须是物理连续的，强制加上连续内存标志。
+			3. if (alloc_kmap) 安全校验：安全内存位于 ARM TrustZone 安全世界，
+				普通世界的 Linux 内核绝对无法直接访问，如果用户要求分配内核映射，
+				直接报错返回-EINVAL，符合安全隔离的硬性要求。
+			4. ret = rockchip_gem_alloc_secure(rk_obj)：调用安全内存分配函数，核心逻辑：
+				从提前预留的安全内存池private->secure_buffer_pool分配物理连续内存；
+				填充物理地址、pages 数组、sg_table 散列表；
+				完成安全内存的所有元数据初始化。
+		*/
 		rk_obj->buf_type = ROCKCHIP_GEM_BUF_TYPE_SECURE;
 		rk_obj->flags |= ROCKCHIP_BO_CONTIG;
 		if (alloc_kmap) {
@@ -441,17 +465,49 @@ static int rockchip_gem_alloc_buf(struct rockchip_gem_object *rk_obj,
 		if (ret)
 			return ret;
 	} else if (rk_obj->flags & ROCKCHIP_BO_CONTIG) {
+		/*
+			触发条件：无安全内存标志，但设置了ROCKCHIP_BO_CONTIG（用户传入 / 无 IOMMU 强制添加），
+			走 CMA（连续内存分配器）路径，分配物理地址连续的内存。
+			ret = rockchip_gem_alloc_dma(rk_obj, alloc_kmap)：调用 CMA 内存分配函数，核心逻辑：
+				通过dma_alloc_attrs从内核 CMA 区域分配物理连续内存，
+					默认带DMA_ATTR_WRITE_COMBINE写合并属性；
+				若alloc_kmap=false，添加DMA_ATTR_NO_KERNEL_MAPPING标志，
+					不分配内核虚拟地址，节省内核地址空间；
+				生成dma_handle（物理地址）、kvaddr（内核虚拟地址，按需分配）；
+				生成 sg_table 散列表、填充 pages 数组，为后续 IOMMU 映射、dma-buf 跨进程共享做准备。
+		*/
 		rk_obj->buf_type = ROCKCHIP_GEM_BUF_TYPE_CMA;
 		ret = rockchip_gem_alloc_dma(rk_obj, alloc_kmap);
 		if (ret)
 			return ret;
 	} else {
+		/*
+			无安全标志、无连续内存标志（平台开启 IOMMU 时的默认路径），
+			内存来自之前rockchip_gem_alloc_object创建的匿名 tmpfs 文件，
+			分配离散的物理页，通过 IOMMU 映射给外设使用。
+		*/
 		rk_obj->buf_type = ROCKCHIP_GEM_BUF_TYPE_SHMEM;
+		/*
+			ret = rockchip_gem_get_pages(rk_obj)：SHMEM 路径的核心，
+				真正为 tmpfs 文件分配物理内存，核心逻辑：
+			调用drm_gem_get_pages，从 tmpfs 文件分配所有需要的物理页，
+				存入rk_obj->pages数组，完成物理内存的实际分配；
+			执行瑞芯微专属的DDR Bank 交错优化：把物理页打散到不同的 DDR Bank，
+				避免 Bank 冲突，大幅提升内存带宽性能；
+			生成 sg_table 散列表，同步 DMA 地址，为后续 IOMMU 映射做准备。
+		*/
 		ret = rockchip_gem_get_pages(rk_obj);
 		if (ret < 0)
 			return ret;
 
 		if (alloc_kmap) {
+			/*
+				调用vmap，把rk_obj->pages里的离散物理页，映射成内核虚拟地址空间的连续地址，
+					赋值给rk_obj->kvaddr，内核态可直接通过该地址连续访问整个 buffer；
+				页属性设置为pgprot_writecombine写合并模式，和 CMA 路径保持一致，
+					兼顾 CPU 读写性能和缓存一致性；
+				若 vmap 失败，返回-ENOMEM，跳转到err_iommu_free错误处理分支，回滚已分配的资源。
+			*/
 			rk_obj->kvaddr = vmap(rk_obj->pages, rk_obj->num_pages,
 					      VM_MAP,
 					      pgprot_writecombine(PAGE_KERNEL));
@@ -463,6 +519,18 @@ static int rockchip_gem_alloc_buf(struct rockchip_gem_object *rk_obj,
 		}
 	}
 
+	/*
+		if (private->domain) 平台开启 IOMMU：
+			调用rockchip_gem_iommu_map完成 IOMMU 映射，核心逻辑：
+				从 DRM 的 MM 内存管理器分配一段连续的 IOVA 地址空间，大小和 buffer 一致；
+				调用iommu_map_sgtable，把 sg_table 里的物理页（无论连续 / 离散）映射到分配的 IOVA 地址上；
+				刷新 IOMMU 的 TLB，确保映射生效；
+				把映射后的连续 IOVA 地址赋值给rk_obj->dma_addr，这就是外设最终使用的访问地址。
+			映射失败跳转到err_free错误处理分支，回滚所有资源。
+		else if (is_vop_enabled()) 无 IOMMU 且开启了显示控制器：
+			无 IOMMU 时，外设只能直接访问物理地址，因此直接把rk_obj->dma_addr赋值为物理地址rk_obj->dma_handle；
+			WARN_ON(!rk_obj->dma_handle)：内核警告，若物理地址为空，说明之前的连续内存分配异常，方便调试定位问题。
+	*/
 	if (private->domain) {
 		ret = rockchip_gem_iommu_map(rk_obj);
 		if (ret < 0)
@@ -610,14 +678,43 @@ static void rockchip_gem_release_object(struct rockchip_gem_object *rk_obj)
 	kfree(rk_obj);
 }
 
+/*
+	创建并初始化瑞芯微定制的 GEM 对象结构体、配置内存分配规则、
+		完成 DRM 标准 GEM 对象的基础初始化，为后续真正的物理内存分配（rockchip_gem_alloc_buf）做全链路的前置准备。
+	关键区分：这个函数只分配「管理内存的结构体」，不分配真正的图形缓冲区物理内存，
+		物理内存的分配在后续的rockchip_gem_alloc_buf中完成。
+*/
 static struct rockchip_gem_object *
 rockchip_gem_alloc_object(struct drm_device *drm, unsigned int size,
 			  unsigned int flags)
 {
+	/*
+		Linux 内核address_space结构体指针，每个文件 inode 都对应一个地址空间，用来管理文件的页缓存。
+		GEM 对象会绑定一个匿名 tmpfs 文件，这个变量就是该文件的页缓存管理结构，用来控制后续物理内存的分配规则。
+	*/
 	struct address_space *mapping;
 	struct rockchip_gem_object *rk_obj;
 	struct drm_gem_object *obj;
 
+	/*
+		CONFIG_ARM_LPAE	ARM 
+			大物理地址扩展宏，开启后支持超过 4GB 的物理地址。
+			瑞芯微 ARM64 平台默认开启，此时默认强制从 4GB 
+			以内的 DMA32 区域分配内存，因为显示控制器 VOP、
+			Mali GPU 等外设大多只支持 32 位地址寻址，避免访问不到 4GB 以上的高地址内存。
+		GFP_HIGHUSER	
+			图形缓冲区的标准分配标志，含义：
+			1. 从用户空间可用的高端内存（HIGHMEM）分配；
+			2. 分配的内存可被 mmap 到用户空间（给 Weston、Android 显示系统等应用使用）；
+			3. 允许内核在内存紧张时进行回收。
+		__GFP_RECLAIMABLE	
+			标记内存是可回收的，内核内存管理系统在内存紧张时，
+			可对该内存进行回收 / 换出，避免被当成不可回收内存长期占用，
+			导致系统 OOM。
+		__GFP_DMA32	
+			强制从ZONE_DMA32内存区域分配，保证物理地址在 4GB 以内，
+			专门给有 32 位地址寻址限制的外设使用。
+	*/
 #ifdef CONFIG_ARM_LPAE
 	gfp_t gfp_mask = GFP_HIGHUSER | __GFP_RECLAIMABLE | __GFP_DMA32;
 #else
@@ -634,12 +731,73 @@ rockchip_gem_alloc_object(struct drm_device *drm, unsigned int size,
 		return ERR_PTR(-ENOMEM);
 
 	obj = &rk_obj->base;
-
+	
+	/*
+		这个接口完成 GEM 对象的核心初始化，是整个 GEM 生命周期的起点，它做的事情包括：
+		1.初始化 GEM 对象的引用计数为 1，这是 GEM 对象生命周期管理的核心，引用计数归 0 时自动释放对象；
+		2.绑定 GEM 对象和 DRM 驱动设备，把obj->dev设置为传入的drm设备；
+		3.设置obj->size为页对齐后的缓冲区大小，记录 GEM 对象对应的内存总大小；
+		4.初始化 GEM 对象的锁、链表节点、文件操作相关字段，为后续的 handle 创建、mmap 映射、dma-buf 导出共享做准备；
+		5.创建 GEM 对象对应的匿名 tmpfs 文件（obj->filp），这是 DRM GEM 框架的核心设计：
+			每个 GEM 对象都对应一个匿名文件，通过文件系统的页缓存机制管理图形内存，生命周期和文件完全绑定。
+	*/
 	drm_gem_object_init(drm, obj, size);
 
+	/*
+		file_inode(obj->filp)->i_mapping
+		obj->filp：上一步drm_gem_object_init创建的匿名 tmpfs 文件的struct file指针；
+		file_inode()：内核标准函数，从文件指针获取对应的 
+			inode 节点（Linux 文件系统中描述文件的核心结构）；
+		i_mapping：inode 对应的address_space地址空间，也就是这个匿名文件的页缓存管理结构，
+			后续 GEM 缓冲区的物理内存，就是通过这个地址空间分配的。
+		mapping_set_gfp_mask()
+			内核标准函数，作用是覆盖地址空间默认的内存分配掩码；
+			核心目的：后续内核为这个 GEM 对象分配物理内存页时，
+				会强制使用我们这里设置的gfp_mask，而不是 tmpfs 的默认掩码，
+				确保内存分配完全符合我们传入的flags要求（比如强制 DMA32、可回收等）。
+	*/
 	mapping = file_inode(obj->filp)->i_mapping;
+	// 连续物理页cma不需要使用tmpfs
+	// SHMEM 类型 buffer（无 ROCKCHIP_BO_CONTIG 标志）
+	// 物理页完全来自这个 tmpfs 文件：rockchip_gem_get_pages 从 tmpfs 分配物理页，存入 rk_obj->pages 数组；
+	// 后续 rockchip_gem_iommu_map 函数，就是把 rk_obj->pages 里的这些物理页，映射到 IOMMU 域，
+	// 生成外设可访问的连续 IOVA 地址，存入 rk_obj->dma_addr，给 VOP/VDU/GPU 等外设使用；
+	// 结论：这种场景下，IOMMU 映射的物理内存，100% 来自这个 tmpfs 文件。
+	/*
+		这两行的本质是覆盖 tmpfs 默认的 GFP 内存分配掩码。tmpfs 默认的 GFP 掩码仅为 GFP_HIGHUSER，
+		无法满足瑞芯微平台的硬件需求，
+		必须通过这个方式，让后续 tmpfs 分配物理页时，严格遵守你设置的分配规则（比如强制 DMA32、可回收等）。
+	*/
 	mapping_set_gfp_mask(mapping, gfp_mask);
 
+	/*
+		1.GEM 对象的生命周期管理
+			Linux 内核中，文件的引用计数机制是最成熟、最健壮的。GEM 对象绑定匿名 tmpfs 文件后，
+			整个生命周期和文件完全绑定：
+			用户态创建 GEM handle、mmap 映射、导出 dma-buf 共享，都会增加文件的引用计数；
+			用户态关闭 handle、解除 mmap、关闭 dma-buf fd，都会减少引用计数；
+			引用计数归 0 时，内核自动销毁 tmpfs 文件，释放对应的物理内存，从根本上避免内存泄漏。
+			这就是 DRM GEM 的「file-backed」核心设计思想，也是 Linux 所有子系统共享内存的通用方案。
+		2.图形内存的统一管理载体
+			你传入的size对应的图形缓冲区，本质上就是这个 tmpfs 文件的「内容」：
+			缓冲区的物理内存，就是 tmpfs 文件的页缓存（page cache）；
+			你代码里的drm_gem_get_pages，本质就是从这个 tmpfs 文件的address_space里，
+				获取 / 分配所有的物理页；
+			内核内存管理系统会像管理普通文件的页缓存一样，管理 GEM 内存，支持内存回收、
+				swap 换出（开启 swap 时），避免长期占用不可回收的内核内存。
+		3.跨进程零拷贝共享的基础
+				嵌入式 Linux/Android 的显示链路中，GPU、视频解码器、摄像头 ISP、
+			显示合成器（Weston/SurfaceFlinger）之间的零拷贝图像共享，核心就是这个 tmpfs 文件：
+				一个进程创建 GEM 缓冲区后，可通过dma_buf_export把匿名 tmpfs 
+			文件封装成 dma-buf，拿到一个文件描述符 fd；
+				通过 UNIX 域套接字，把这个 fd 传给另一个进程；
+			另一个进程拿到 fd 后，mmap 就能直接访问同一块物理内存，无需任何数据拷贝；
+			整个过程，共享的核心就是 tmpfs 文件的物理页。
+		4.用户态 mmap 映射的标准接口
+			Linux 用户态要访问内核分配的物理内存，最标准、最安全的方式就是 mmap 一个文件。
+				GEM 对象绑定 tmpfs 文件后，用户态可直接通过 DRM 的 mmap 接口，把 tmpfs 
+			文件的物理页映射到用户态虚拟地址空间，实现 CPU 对图形缓冲区的直接读写，无需复杂的内核驱动交互。
+	*/
 	return rk_obj;
 }
 
@@ -919,6 +1077,13 @@ void rockchip_gem_prime_vunmap(struct drm_gem_object *obj, void *vaddr)
 int rockchip_gem_create_ioctl(struct drm_device *dev, void *data,
 			      struct drm_file *file_priv)
 {
+	/*
+		struct drm_rockchip_gem_create {
+			uint64_t size;
+			uint32_t flags;
+			uint32_t handle;
+		};
+	*/
 	struct drm_rockchip_gem_create *args = data;
 	struct rockchip_gem_object *rk_obj;
 
