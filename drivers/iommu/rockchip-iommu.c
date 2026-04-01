@@ -88,14 +88,14 @@
 #define RK_IOMMU_PGSIZE_BITMAP 0x007ff000
 
 struct rk_iommu_domain {
-	struct list_head iommus;
-	u32 *dt; /* page directory table */
-	dma_addr_t dt_dma;
-	spinlock_t iommus_lock; /* lock for iommus list */
-	spinlock_t dt_lock; /* lock for modifying page directory table */
-	bool shootdown_entire;
+	struct list_head iommus; // 绑定到该域的所有IOMMU硬件实例链表
+	u32 *dt; /* page directory table 一级页表（目录表DT）的内核虚拟地址 */
+	dma_addr_t dt_dma; // 一级页表的DMA物理地址（供IOMMU硬件访问）
+	spinlock_t iommus_lock; /* lock for iommus list */  // 保护iommus链表的自旋锁
+	spinlock_t dt_lock; /* lock for modifying page directory table */ // 保护页表修改的自旋锁
+	bool shootdown_entire; // 整表刷新IOTLB的标志位
 
-	struct iommu_domain domain;
+	struct iommu_domain domain; // 内核通用IOMMU域结构体（标准接口载体）
 };
 
 struct rk_iommu_ops {
@@ -1313,10 +1313,24 @@ static int rk_iommu_attach_device(struct iommu_domain *domain,
 	return ret;
 }
 
+/*
+	这个函数是Rockchip IOMMU 驱动对接 Linux 内核 IOMMU 框架的核心底层回调，
+		是你上层调用 iommu_domain_alloc(&platform_bus_type) 的最终执行实体。
+	它的核心职责是：分配、初始化 Rockchip 专属的 IOMMU 域结构体，
+		以及配套的两级硬件页表资源，完成软件页表与 IOMMU 硬件的基础关联，
+		是整个 IOMMU 地址转换体系的初始化起点。
+*/
 static struct iommu_domain *rk_iommu_domain_alloc(unsigned type)
 {
 	struct rk_iommu_domain *rk_domain;
 
+	// 过滤 Rockchip IOMMU 驱动不支持的域类型，仅允许两种合法域类型，其他类型直接拒绝分配。
+	/*
+		非托管域，完全由驱动自主管理 IOVA 地址的分配、释放、映射，内核 DMA 框架不干预
+			你在 RK3588 DRM 驱动中使用的类型，显示驱动通过drm_mm自主管理显存 IOVA 空间，完全控制映射逻辑
+		内核托管 DMA 域，由 Linux DMA-IOMMU 框架统一管理 IOVA，供标准 DMA-API（dma_alloc_coherent等）使用
+			通用外设驱动使用，无需手动管理地址映射，内核自动完成
+	*/
 	if (type != IOMMU_DOMAIN_UNMANAGED && type != IOMMU_DOMAIN_DMA)
 		return NULL;
 
@@ -1327,6 +1341,16 @@ static struct iommu_domain *rk_iommu_domain_alloc(unsigned type)
 	if (!rk_domain)
 		return NULL;
 
+	/*
+		核心作用：仅针对IOMMU_DOMAIN_DMA类型的域，向内核 DMA-IOMMU 框架申请专属 DMA Cookie。
+		关键细节：
+			iommu_get_dma_cookie：内核标准 API，为 DMA 域分配一个专属管理结构体，
+				用于内核托管 IOVA 空间、映射缓存、地址池管理；
+			非托管域无需申请：IOMMU_DOMAIN_UNMANAGED类型的域，IOVA 完全由驱动自主管理，
+				不需要内核 DMA 框架的 Cookie；
+			失败处理：Cookie 申请失败时，跳转到err_free_domain标签，
+				逆序释放已分配的rk_domain结构体，避免内存泄漏
+	*/
 	if (type == IOMMU_DOMAIN_DMA &&
 	    iommu_get_dma_cookie(&rk_domain->domain))
 		goto err_free_domain;
@@ -1336,10 +1360,44 @@ static struct iommu_domain *rk_iommu_domain_alloc(unsigned type)
 	 * Each level1 (dt) and level2 (pt) table has 1024 4-byte entries.
 	 * Allocate one 4 KiB page for each table.
 	 */
+	/*
+		为 Rockchip IOMMU 的一级页表（目录表 DT） 分配物理内存，这是 IOMMU 地址转换的核心硬件页表。
+		1. 两级页表硬件规则：注释明确了 Rockchip IOMMU 的硬件页表架构：
+			一级 DT 表：1024 个 4 字节表项，对应 1024 个二级 PT 页表；
+			二级 PT 表：1024 个 4 字节表项，每个表项对应一个 4KB 物理页；
+			单个 DT/PT 表正好占用 1 个 4KB 物理页（1024×4=4096 字节），对应宏SPAGE_SIZE=4KB。
+		2. get_zeroed_page：分配 1 个连续的 4KB 物理页，并清零所有字节，正好适配 DT 表的大小。
+		3. GFP_KERNEL | GFP_DMA32：分配掩码的核心约束：
+			GFP_KERNEL：允许睡眠，符合进程上下文要求；
+			GFP_DMA32：强制分配 32 位物理地址范围内的内存，这是 Rockchip IOMMU 的硬件限制 
+				—— 即使是 v2 版本，DT 表基地址也必须在 32 位地址范围内。
+		4. 赋值给rk_domain->dt：保存 DT 表的内核虚拟地址，驱动后续修改页表、创建映射时，
+			都通过这个虚拟地址操作。
+		5. 失败处理：物理页分配失败时，跳转到err_put_cookie标签，释放已申请的 Cookie 和结构体。
+	*/
 	rk_domain->dt = (u32 *)get_zeroed_page(GFP_KERNEL | GFP_DMA32);
 	if (!rk_domain->dt)
 		goto err_put_cookie;
-
+	
+	/*
+		核心作用：为 DT 页表创建 DMA 映射，获取 DT 表的总线物理地址（DMA 地址），
+			这是软件页表能被 IOMMU 硬件读取的最核心一步。
+		1. dma_map_single：内核 DMA-API 标准函数，完成两个核心动作：
+			对 DT 页的内存做 Cache 同步，确保 CPU 修改的页表数据，
+				能被 IOMMU 硬件正确读取（解决 CPU Cache 与外设的一致性问题）；
+			返回 DT 页的总线物理地址，这个地址是 IOMMU 硬件能直接访问的地址，而非内核虚拟地址。
+		2. 入参说明：
+			dma_dev：全局 IOMMU 参考设备，保证 DMA 映射符合平台总线规则；
+			rk_domain->dt：DT 表的内核虚拟地址；
+			SPAGE_SIZE：映射长度 4KB，正好是一个 DT 页的大小；
+			DMA_TO_DEVICE：数据流向为 “内核→硬件”，即内核修改页表，硬件只读，做单向 Cache 同步。
+		3. 赋值给rk_domain->dt_dma：保存 DT 表的 DMA 物理地址，后续在rk_iommu_attach_device中，
+			会把这个地址写入 IOMMU 硬件的RK_MMU_DTE_ADDR寄存器，硬件就是从这个地址读取 DT 页表，
+			完成 DMA 地址转换。
+		4. 失败处理：通过dma_mapping_error校验映射有效性，映射失败则打印错误日志，
+			跳转到err_free_dt标签释放 DT 页。
+		常见失败原因：DMA 地址超出设备寻址范围、IOMMU 设备 DMA 掩码配置错误、系统内存碎片化严重。
+	*/
 	rk_domain->dt_dma = dma_map_single(dma_dev, rk_domain->dt,
 					   SPAGE_SIZE, DMA_TO_DEVICE);
 	if (dma_mapping_error(dma_dev, rk_domain->dt_dma)) {
@@ -1351,6 +1409,17 @@ static struct iommu_domain *rk_iommu_domain_alloc(unsigned type)
 	spin_lock_init(&rk_domain->dt_lock);
 	INIT_LIST_HEAD(&rk_domain->iommus);
 
+	/*
+		核心作用：配置该 IOMMU 域支持的IOVA 地址空间范围，告知内核 IOMMU 框架该域的硬件寻址能力。
+		逐行说明：
+		aperture_start = 0：设置 IOVA 地址空间的起始地址为 0，即虚拟地址从 0 开始。
+		aperture_end = DMA_BIT_MASK(32)：设置 IOVA 地址空间的结束地址为 32 位地址最大值（0xFFFFFFFF），
+			即该域最大支持4GB 的 IOVA 地址空间。
+		硬件约束：Rockchip IOMMU 的 IOVA 地址格式为 32 位，高 10 位是 DTE 索引、中间 10 位是 PTE 索引、
+			低 12 位是页内偏移，正好对应 32 位地址宽度。
+		force_aperture = true：强制内核严格校验 IOVA 范围，所有映射的 IOVA 必须在0~0xFFFFFFFF之间，
+			超出范围的映射直接拒绝，保证映射符合硬件地址格式要求。
+	*/
 	rk_domain->domain.geometry.aperture_start = 0;
 	rk_domain->domain.geometry.aperture_end   = DMA_BIT_MASK(32);
 	rk_domain->domain.geometry.force_aperture = true;
@@ -1500,19 +1569,125 @@ void rockchip_iommu_unmask_irq(struct device *dev)
 EXPORT_SYMBOL(rockchip_iommu_unmask_irq);
 
 static const struct iommu_ops rk_iommu_ops = {
+	/*
+		分配并初始化一个 Rockchip 专属的 IOMMU 域（struct rk_iommu_domain），
+		是内核iommu_domain_alloc的底层实现
+		关键操作：
+			1. 校验域类型（仅支持IOMMU_DOMAIN_UNMANAGED（驱动自主管理）和IOMMU_DOMAIN_DMA（内核 DMA 托管））；
+			2. 分配struct rk_iommu_domain结构体，初始化双级页表（目录表 DT + 页表 PT）：
+				分配 4KB 物理页作为 DT，初始化 DT 的 DMA 地址映射；
+			3. 初始化域的自旋锁（dt_lock/iommus_lock）、IOMMU 设备链表、
+				地址空间范围（默认 0~32 位地址）；
+			4. 为 DMA 域申请内核 DMA cookie，完成域与内核 DMA 框架的对接。
+		调用场景：上层调用iommu_domain_alloc(&platform_bus_type)时，内核框架会回调此函数。
+		硬件关联：为后续页表写入 IOMMU 硬件的RK_MMU_DTE_ADDR寄存器做准备。
+	*/
 	.domain_alloc = rk_iommu_domain_alloc,
+	/*
+		核心功能：销毁已分配的 IOMMU 域，释放所有关联资源，是内核iommu_domain_free的底层实现。
+		关键操作：
+			1. 校验域的设备链表是否为空（防止域仍绑定设备时被释放）；
+			2. 遍历 DT 所有表项，释放所有已分配的 PT 页表，解除 DMA 映射；
+			3. 释放 DT 页表的内存和 DMA 映射，最终释放struct rk_iommu_domain结构体；
+			4. 归还 DMA 域的 cookie，清理内核 DMA 框架关联。
+		调用场景：驱动卸载 / 出错时，调用iommu_domain_free释放域时触发。
+		硬件关联：无直接硬件操作，仅释放软件层页表资源，硬件侧的页表地址会在detach_dev时清零。
+	*/
 	.domain_free = rk_iommu_domain_free,
+	/*
+		将指定设备绑定到目标 IOMMU 域，是内核iommu_attach_device的底层实现，绑定成功后设备的 DMA 事务才会经过 IOMMU 地址转换。
+		关键操作：
+		1. 通过设备私有数据获取对应的 Rockchip IOMMU 硬件实例（struct rk_iommu）；
+		2. 若设备已绑定其他域，先调用detach_dev解绑旧域；
+		3. 将设备的 IOMMU 实例加入域的设备链表，关联域的shootdown_entire（整表刷新 IOTLB）特性；
+		4. 使能 IOMMU 硬件（调用rk_iommu_enable）：配置硬件 DT 地址、使能地址转换、开启中断掩码；
+		5. 若绑定失败，回滚所有操作，重新解绑设备。
+		调用场景：驱动中调用iommu_attach_device(domain, &pdev->dev)时触发（如 RK3588 DRM 驱动绑定 VOP 到显示专属域）。
+		硬件关联：最终会将域的 DT 页表 DMA 地址写入 IOMMU 硬件的RK_MMU_DTE_ADDR寄存器，开启硬件地址转换。
+	*/
 	.attach_dev = rk_iommu_attach_device,
+	/*
+		将设备从已绑定的 IOMMU 域中解绑，是内核iommu_detach_device的底层实现，
+			解绑后设备的 DMA 事务将绕过 IOMMU（直接物理地址访问）
+		调用场景：驱动卸载 / 设备解绑时，调用iommu_detach_device(domain, &pdev->dev)时触发。
+		硬件关联：直接操作硬件寄存器，关闭地址转换并清零页表地址，硬件停止所有地址转换工作。
+	*/
 	.detach_dev = rk_iommu_detach_device,
+	/*
+		建立 IOVA 到物理地址的映射关系，是内核iommu_map的底层实现，
+			映射成功后设备可通过 IOVA 访问指定物理内存。
+		调用场景：驱动中为设备分配显存 / 数据缓冲区后，调用iommu_map建立地址映射时触发。
+		硬件关联：
+			填充的 PT 表项最终会通过 DMA 映射被 IOMMU 硬件读取；
+			刷新 IOTLB 通过写硬件RK_MMU_ZAP_ONE_LINE寄存器实现。
+	*/
 	.map = rk_iommu_map,
+	/*
+		解除 IOVA 到物理地址的映射关系，是内核iommu_unmap的底层实现，
+			解映射后设备无法再通过该 IOVA 访问物理内存。
+		调用场景：驱动中释放显存 / 数据缓冲区时，调用iommu_unmap解除地址映射时触发。
+		硬件关联：
+			清空 PT 表项后，硬件读取到无效表项会触发页故障；
+			刷新 IOTLB 通过写硬件RK_MMU_ZAP_ONE_LINE寄存器实现。
+	*/
 	.unmap = rk_iommu_unmap,
+	/*
+		刷新当前域下所有绑定 IOMMU 硬件的整个 IOTLB 缓存，是内核iommu_flush_iotlb_all
+			的底层实现，清除所有缓存的映射关系，强制硬件重新从页表读取映射。
+		调用场景：批量解映射 / 域配置变更后，需要全局清除 IOTLB 缓存时触发（如驱动批量释放显存）。
+		硬件关联：直接下发硬件命令RK_MMU_CMD_ZAP_CACHE，是硬件级别的缓存刷新操作。
+	*/
 	.flush_iotlb_all = rk_iommu_flush_tlb_all,
+	/*
+		探测设备并建立设备与 IOMMU 硬件的运行时 PM 链接，是内核框架枚举设备时的底层回调。
+		调用场景：内核 IOMMU 框架枚举外设设备（如 VOP/NPU）时自动触发。
+		硬件关联：无直接硬件操作，仅建立软件层的 PM 联动关系，为后续硬件时钟 / 电源的自动管理做准备。
+	*/
 	.probe_device = rk_iommu_probe_device,
+	/*
+		释放设备与 IOMMU 硬件的关联关系，销毁 PM 链接，是内核框架释放设备时的底层回调。
+		调用场景：内核移除外设设备时自动触发。
+		硬件关联：无直接硬件操作，仅清理软件层联动关系。
+	*/
 	.release_device = rk_iommu_release_device,
+	/*
+		根据已建立的映射关系，将IOVA 转换为对应的物理地址，是内核iommu_iova_to_phys的底层实现，
+			用于上层驱动校验地址映射是否正确。
+		调用场景：驱动中需要验证 IOVA 对应的物理地址、调试地址映射问题时调用。
+		硬件关联：无直接硬件操作，仅从软件层页表中读取映射关系，与硬件 IOTLB 缓存无关。
+	*/
 	.iova_to_phys = rk_iommu_iova_to_phys,
+	/*
+		查询设备是否开启绑定延迟特性，是内核框架判断是否需要延迟执行attach_dev的底层回调。
+		调用场景：内核 IOMMU 框架执行attach_dev前，判断是否需要延迟绑定
+			（如 VOP 设备需要等待 DRM 驱动初始化完成后再绑定）。
+		硬件关联：无硬件操作，纯软件层的状态判断，是 Rockchip 为 VOP 设备做的专属适配。
+	*/
 	.is_attach_deferred = rk_iommu_is_attach_deferred,
+	/*
+		获取设备所属的IOMMU 组，是内核 IOMMU 框架实现设备隔离的底层回调。
+		调用场景：内核 IOMMU 框架进行设备隔离检查、sysfs 节点创建时触发。
+		硬件关联：无直接硬件操作，IOMMU 组是软件层的隔离机制，一个组对应一个独立的 IOMMU 硬件实例。
+	*/
 	.device_group = rk_iommu_device_group,
+	/*
+		告知内核 IOMMU 框架当前硬件支持的页大小位图，定义了驱动支持的映射粒度。
+		内核作用：内核框架会根据该位图校验上层iommu_map的映射大小，若超出范围则直接返回错误，
+			保证映射大小与硬件能力匹配。
+		硬件关联：直接对应 Rockchip IOMMU 的双级页表硬件设计（DT+PT，单 PT 最大管理 4MB 地址空间）。	
+	*/
 	.pgsize_bitmap = RK_IOMMU_PGSIZE_BITMAP,
+	/*
+		设备树解析的核心回调，完成外设设备树节点到Rockchip IOMMU 硬件实例的绑定，
+			是所有设备与 IOMMU 关联的起点
+		1. 从设备树的iommus属性中，解析出对应的 IOMMU 节点（如 VOP 节点的iommus = <&vop_mmu 0>）；
+		2. 根据 IOMMU 节点找到对应的 platform 设备，获取设备的私有数据（即 Rockchip IOMMU 硬件实例）；
+		3. 为外设设备分配 IOMMU 私有数据（struct rk_iommudata），将 IOMMU 实例与设备关联；
+		4. 专属适配：若设备名包含vop，将defer_attach置为 true，开启 VOP 设备的绑定延迟特性；
+		5. 将私有数据存入设备的 IOMMU 私有域，完成设备与 IOMMU 的底层关联。
+		调用场景：内核启动时，解析设备树中外设节点的iommus属性时自动触发。
+		硬件关联：无直接硬件操作，完成设备树静态绑定到软件层实例关联的转换，是后续所有绑定 / 映射操作的基础。
+	*/
 	.of_xlate = rk_iommu_of_xlate,
 };
 
@@ -1525,6 +1700,11 @@ static int rk_iommu_probe(struct platform_device *pdev)
 	int num_res = pdev->num_resources;
 	int err, i;
 
+	/*
+		devm_kzalloc分配struct rk_iommu结构体，这是每个 IOMMU 硬件实例的核心抽象。
+		RK3588 有多个独立的 IOMMU 控制器（VOP、GPU、VDU、HDMI 等外设各对应一个），
+		每个控制器都会对应一个该结构体实例，保存硬件资源、状态、绑定的域等所有信息
+	*/
 	iommu = devm_kzalloc(dev, sizeof(*iommu), GFP_KERNEL);
 	if (!iommu)
 		return -ENOMEM;
@@ -1544,6 +1724,10 @@ static int rk_iommu_probe(struct platform_device *pdev)
 	if (WARN_ON(rk_ops != ops))
 		return -EINVAL;
 
+	/*
+		寄存器数组分配：devm_kcalloc为寄存器基地址数组分配内存，
+		数组大小等于设备树reg属性的数量（一个 IOMMU 控制器可能包含多个 MMU 硬件实例，对应多组寄存器）
+	*/
 	iommu->bases = devm_kcalloc(dev, num_res, sizeof(*iommu->bases),
 				    GFP_KERNEL);
 	if (!iommu->bases)
@@ -1561,25 +1745,34 @@ static int rk_iommu_probe(struct platform_device *pdev)
 	if (iommu->num_mmu == 0)
 		return PTR_ERR(iommu->bases[0]);
 
+	// platform_irq_count获取设备树interrupts属性配置的中断数量，
+	// 中断是 IOMMU 处理页故障、总线错误的核心机制。
 	iommu->num_irq = platform_irq_count(pdev);
 	if (iommu->num_irq < 0)
 		return iommu->num_irq;
-
+	// rockchip,disable-device-link-resume;
+	// rockchip,shootdown-entire;
+	// 禁用 IOMMU 强制复位，适配部分老平台的硬件 bug
 	iommu->reset_disabled = device_property_read_bool(dev,
 					"rockchip,disable-mmu-reset");
+	// 跳过寄存器读操作，适配 RK3126/RK3128 等平台 VOP IOMMU 读寄存器异常的问题，RK3588 默认关闭
 	iommu->skip_read = device_property_read_bool(dev,
 					"rockchip,skip-mmu-read");
+	// 禁用设备链接的运行时电源管理恢复，特殊电源场景适配
 	iommu->dlr_disable = device_property_read_bool(dev,
 					"rockchip,disable-device-link-resume");
+	// 地址解映射时，刷新整个 IOTLB（地址翻译缓存），而非单条缓存线，部分平台性能优化用
 	iommu->shootdown_entire = device_property_read_bool(dev,
 					"rockchip,shootdown-entire");
+	// 中断由外设主设备（如 VOP/DRM 驱动）自行处理，而非 IOMMU 驱动默认处理，适配缺页时动态映射的场景
 	iommu->master_handle_irq = device_property_read_bool(dev,
 					"rockchip,master-handle-irq");
+	// 硬件命令下发失败时自动重试
 	if (of_machine_is_compatible("rockchip,rv1126") ||
 	    of_machine_is_compatible("rockchip,rv1109"))
 		iommu->cmd_retry = device_property_read_bool(dev,
 					"rockchip,enable-cmd-retry");
-
+	// 开启预留内存映射，用预定义的安全页面填充未映射的地址，避免硬件非法访问导致系统崩溃
 	iommu->need_res_map = device_property_read_bool(dev,
 					"rockchip,reserve-map");
 
@@ -1588,6 +1781,13 @@ static int rk_iommu_probe(struct platform_device *pdev)
 	 * but there are older devicetrees without clocks out in the wild.
 	 * So clocks as optional for the time being.
 	 */
+	/*
+		时钟批量获取：devm_clk_bulk_get_all批量获取设备树clocks属性配置的所有时钟，
+			IOMMU 硬件必须在时钟使能的状态下才能正常工作。
+		时钟准备：clk_bulk_prepare完成时钟的初始化准备，不会直接使能时钟。
+			时钟的使能 / 关闭，放在后续的运行时电源管理（Runtime PM）回调中，
+			仅当有设备绑定到 IOMMU 域时才会使能时钟，降低功耗。
+	*/
 	err = devm_clk_bulk_get_all(dev, &iommu->clocks);
 	if (err == -ENOENT)
 		iommu->num_clocks = 0;
@@ -1599,17 +1799,33 @@ static int rk_iommu_probe(struct platform_device *pdev)
 	err = clk_bulk_prepare(iommu->num_clocks, iommu->clocks);
 	if (err)
 		return err;
-
+	
+	/*
+		分配 IOMMU 组：iommu_group_alloc为该 IOMMU 控制器分配一个独立的IOMMU 组。
+			IOMMU 组是内核 IOMMU 子系统的最小硬件隔离单元，同一个组内的设备不
+			能分属不同的 IOMMU 域，保证 DMA 地址空间的安全隔离。
+	*/
 	iommu->group = iommu_group_alloc();
 	if (IS_ERR(iommu->group)) {
 		err = PTR_ERR(iommu->group);
 		goto err_unprepare_clocks;
 	}
 
+	/*
+		创建 sysfs 节点：iommu_device_sysfs_add在/sys/class/iommu/路径下创建 
+		IOMMU 设备的 sysfs 节点，用于用户态调试、查看 IOMMU 设备状态。
+	*/
 	err = iommu_device_sysfs_add(&iommu->iommu, dev, NULL, dev_name(dev));
 	if (err)
 		goto err_put_group;
 
+	/*
+		iommu_device_set_ops给 IOMMU 设备绑定核心操作集rk_iommu_ops。
+		这个rk_iommu_ops是整个驱动的灵魂，实现了内核 IOMMU 标准 API 的所有底层回调，
+			包括domain_alloc、attach_dev、map、unmap等；
+		iommu_domain_alloc，最终会回调到这里绑定的rk_iommu_ops->domain_alloc，
+			也就是源码中的rk_iommu_domain_alloc函数。
+	*/
 	iommu_device_set_ops(&iommu->iommu, &rk_iommu_ops);
 
 	iommu_device_set_fwnode(&iommu->iommu, &dev->of_node->fwnode);
@@ -1626,6 +1842,21 @@ static int rk_iommu_probe(struct platform_device *pdev)
 	if (!dma_dev)
 		dma_dev = &pdev->dev;
 
+	/*
+		DMA 设备初始化：全局dma_dev用于 IOMMU 页表的 DMA 同步操作，
+		赋值为第一个注册成功的 IOMMU 设备，后续dma_map_single、
+		dma_sync_single_for_device等 DMA 操作都基于这个设备执行
+
+		总线 IOMMU 能力绑定：bus_set_iommu(&platform_bus_type, &rk_iommu_ops)
+		核心作用：给 Linux platform 虚拟总线设置 IOMMU 操作集，告诉内核 IOMMU 框架：
+			platform 总线下的所有设备，都使用rk_iommu_ops处理 IOMMU 相关操作。
+		与你的代码关联：iommu_domain_alloc函数的第一步，就是检查传入的bus指针是否绑
+			定了有效的iommu_ops。只有这行代码执行成功，platform_bus_type的
+			iommu_ops才会被赋值为rk_iommu_ops，你的iommu_domain_alloc调用才不会返回NULL。
+		执行限制：仅第一个注册的 IOMMU 设备会执行该操作，后续 IOMMU 设备 probe 时，
+			dma_dev已非空，不会重复绑定，避免总线操作集被覆盖。
+
+	*/
 	bus_set_iommu(&platform_bus_type, &rk_iommu_ops);
 
 	pm_runtime_enable(dev);
@@ -1633,6 +1864,7 @@ static int rk_iommu_probe(struct platform_device *pdev)
 	if (iommu->skip_read)
 		goto skip_request_irq;
 
+	// 遍历所有中断号，通过devm_request_irq申请中断，中断处理函数为rk_iommu_irq
 	for (i = 0; i < iommu->num_irq; i++) {
 		int irq = platform_get_irq(pdev, i);
 
@@ -1654,6 +1886,13 @@ skip_request_irq:
 		pr_info("%s,%d, res_page = 0x%pa\n", __func__, __LINE__, &res_page);
 	}
 
+	/*
+		DMA 寻址掩码设置：dma_set_mask_and_coherent设置 IOMMU 设备的 DMA 寻址能力，
+			使用硬件操作集对应的dma_bit_mask：
+		v1 版本：DMA_BIT_MASK(32)，最大支持 4GB 物理地址寻址；
+		v2 版本（RK3588）：DMA_BIT_MASK(40)，最大支持 1TB 物理地址寻址，
+			完美适配 RK3588 最大 32GB 内存的硬件能力。
+	*/
 	dma_set_mask_and_coherent(dev, rk_ops->dma_bit_mask);
 
 	return 0;
