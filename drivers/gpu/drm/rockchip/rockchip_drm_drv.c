@@ -1866,11 +1866,17 @@ static int rockchip_drm_get_vcnt_event_ioctl(struct drm_device *dev, void *data,
 static const struct drm_ioctl_desc rockchip_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(ROCKCHIP_GEM_CREATE, rockchip_gem_create_ioctl,
 			  DRM_UNLOCKED | DRM_AUTH | DRM_RENDER_ALLOW),
+	/*
+		GEM 缓冲区用户态 mmap 映射的前置必备接口，用来获取 GEM 对象对应的 mmap 文件偏移量，
+			用户态才能通过mmap把内核的图形缓冲区映射到用户态虚拟地址空间，实现 CPU 直接读写。
+	*/
 	DRM_IOCTL_DEF_DRV(ROCKCHIP_GEM_MAP_OFFSET,
 			  rockchip_gem_map_offset_ioctl,
 			  DRM_UNLOCKED | DRM_AUTH | DRM_RENDER_ALLOW),
+	// Rockchip 定制的连续物理缓冲区起始地址获取接口，专门给无 IOMMU 场景、自定义外设驱动提供物理地址访问能力。
 	DRM_IOCTL_DEF_DRV(ROCKCHIP_GEM_GET_PHYS, rockchip_gem_get_phys_ioctl,
 			  DRM_UNLOCKED | DRM_AUTH | DRM_RENDER_ALLOW),
+	// Rockchip 定制的垂直同步（VSYNC）事件与帧计数获取接口，vcnt全称 vblank count（垂直消隐计数），是显示合成、帧率控制、防画面撕裂的核心接口。
 	DRM_IOCTL_DEF_DRV(ROCKCHIP_GET_VCNT_EVENT, rockchip_drm_get_vcnt_event_ioctl,
 			  DRM_UNLOCKED),
 };
@@ -1902,21 +1908,100 @@ static int rockchip_drm_gem_dmabuf_end_cpu_access(struct dma_buf *dma_buf,
 	return rockchip_gem_prime_end_cpu_access(obj, dir);
 }
 
+/*
+	这个结构体是Rockchip DRM GEM 驱动对接 Linux dma-buf 框架的标准操作方法集，
+		是实现跨进程 / 跨设备零拷贝内存共享的核心载体，完全遵循 Linux 内核 
+		dma-buf 框架规范，也是 DRM Prime 机制的核心实现。
+	简单类比：它就像 Linux 驱动里的 file_operations 结构体，file_operations 
+		定义了用户态操作文件时内核的回调逻辑；而这个 dma_buf_ops 定义了内核 
+		/ 用户态操作共享缓冲区时，dma-buf 框架要执行的回调逻辑，是 Rockchip 
+		私有 GEM 内存和内核通用 dma-buf 框架之间的适配层
+
+	标准化适配：把 Rockchip 私有定制的 GEM 内存（SHMEM/CMA/ 安全内存），封装成内核
+		 dma-buf 框架能识别的标准共享缓冲区，实现和其他驱动的无差别兼容；
+	零拷贝共享：避免 GPU 渲染、相机预览、视频解码等场景下的内存拷贝，大幅提升多媒体 / 显示链路性能；
+	生命周期统一管理：通过 dma-buf 的引用计数机制，统一管理跨进程 / 跨设备共享的 GEM 内存，避免内存泄漏、野指针访问；
+	缓存一致性保证：通过自定义的 begin_cpu_access/end_cpu_access 回调，保证 CPU 和外设访问共享内存
+		时的缓存一致性，避免画面花屏、数据错乱。
+*/
 static const struct dma_buf_ops rockchip_drm_gem_prime_dmabuf_ops = {
+	/*
+		这是 dma-buf 框架的性能优化开关，而非回调函数，开启后内核会缓存 
+		map_dma_buf 生成的 sg_table 映射结果，避免重复的 map/unmap 操作。
+		关闭时（默认 false）：每次外设访问 dma-buf 时，都要重新调用 map_dma_buf 
+			生成 sg_table、做 DMA 映射，访问结束后立即 unmap，高频场景（如
+			相机预览 60fps 上屏）会产生大量重复开销；
+		开启时（Rockchip 设置 true）：第一次 map 后，sg_table 会被缓存，后续所有
+			访问都复用这个映射结果，直到 dma-buf 释放才会 unmap，大幅降低 CPU
+			 开销，是嵌入式多媒体场景的标准优化手段。
+		适配场景：完美匹配 Android 显示链路、相机预览、视频播放等高频 dma-buf 共享
+			场景，是 Rockchip 驱动的性能优化关键点。
+	*/
 	.cache_sgt_mapping = true,
+	/*
+		dma-buf 框架标准回调，当其他设备驱动要访问这个 dma-buf 时，
+			会调用该函数完成设备和 dma-buf 的绑定（附着），是跨设备共享的第一步。
+		其他驱动（如 ISP、GPU、编解码器）调用 dma_buf_attach() 把自己的设备绑定到这个 dma-buf 时，内核自动调用该回调。
+		1.检查绑定设备的 DMA 寻址能力，确保设备能访问这个 GEM 缓冲区的物理内存；
+		2.为该设备创建专属的附着上下文，记录设备和 dma-buf 的绑定关系；
+		3.处理 IOMMU 域的适配，确保后续 DMA 映射能正常完成。
+	*/
 	.attach = drm_gem_map_attach,
+	/*
+		和 attach 完全配对的回调，当其他设备不再访问这个 dma-buf 时，解除设备和 dma-buf 的绑定，完成资源清理。
+		触发时机
+		其他驱动调用 dma_buf_detach() 解绑设备时，内核自动调用该回调。
+		实现逻辑
+		使用 DRM 标准函数 drm_gem_map_detach，释放 attach 时创建的附着上下文，清理绑定关系，确保无资源泄漏。
+	*/
 	.detach = drm_gem_map_detach,
+	/*
+		核心作用
+		dma-buf 跨设备共享的核心回调，为访问设备生成 DMA 可用的 sg_table 散列表，并完成 DMA 地址映射，让外设能直接访问这个 GEM 缓冲区的物理内存。
+		触发时机
+		其他驱动调用 dma_buf_map_attachment() 获取缓冲区的 DMA 映射时，内核自动调用该回调。
+		使用 DRM 标准函数 drm_gem_map_dma_buf，核心动作：
+		调用 Rockchip 驱动的 rockchip_gem_prime_get_sg_table（你之前解析的接口），获取 GEM 对象的 sg_table 散列表；
+		为访问设备执行 DMA 映射，填充 sg_table 每个条目的 dma_address（外设可访问的总线地址 / IOVA 地址）；
+		执行 DMA 缓存同步，保证外设能读到最新的内存数据。
+	*/
 	.map_dma_buf = drm_gem_map_dma_buf,
+	// 和 map_dma_buf 配对的回调，解除 DMA 映射，释放 sg_table 相关资源。
 	.unmap_dma_buf = drm_gem_unmap_dma_buf,
+	// dma-buf 生命周期的最终销毁回调，当 dma-buf 的引用计数归 0 时，调用该函数释放绑定的 GEM 对象
 	.release = drm_gem_dmabuf_release,
+	/*
+		触发时机
+		持有 dma-buf fd 的用户态进程调用 mmap() 系统调用，把 fd 映射到自己的虚拟地址空间时，内核自动调用该回调。
+		实现逻辑
+		使用 DRM 标准函数，把 GEM 对象的物理页映射到用户态虚拟地址空间，和你之前解析的 
+			ROCKCHIP_GEM_MAP_OFFSET ioctl + mmap 逻辑完全一致，保证跨进程映射的兼容性。
+	*/
 	.mmap = drm_gem_dmabuf_mmap,
+	// 内核态驱动的虚拟地址映射回调，把 dma-buf 对应的物理页，映射成内核虚拟地址空间的连续地址，供内核态驱动直接线性访问。
 	.vmap = drm_gem_dmabuf_vmap,
 	.vunmap = drm_gem_dmabuf_vunmap,
+	// 获取 dma-buf 绑定的唯一 UUID，用于跨进程 / 跨设备的缓冲区唯一标识，实现缓冲区的全局追踪、权限校验。
 	.get_uuid = drm_gem_dmabuf_get_uuid,
+	// 用户态 / 内核态调用 dma_buf_begin_cpu_access() 时，内核自动调用该回调。
+	/*
+		根据数据方向 dir，执行 DMA 缓存同步：
+		DMA_FROM_DEVICE：外设写入数据，CPU 要读取 → 失效 CPU 缓存，避免读到旧的缓存数据；
+		DMA_TO_DEVICE：CPU 写入数据，外设要读取 → 把 CPU 缓存刷到物理内存；
+		保证 CPU 和外设看到的内存数据完全一致，是避免显示花屏、视频数据错乱的核心保障。
+	*/
 	.begin_cpu_access = rockchip_drm_gem_dmabuf_begin_cpu_access,
+	// 和 begin_cpu_access 配对的回调，CPU 完成对 dma-buf 的访问后调用，完成收尾缓存同步，保证外设能读到 CPU 写入的最新数据。
 	.end_cpu_access = rockchip_drm_gem_dmabuf_end_cpu_access,
 };
 
+/*
+	将一个外部（或同驱动）的 dma-buf 共享缓冲区，转换成 Rockchip DRM 驱动可识别、可操作的标准 GEM 图形对象，让 VOP 显示控制器、
+	GPU 等硬件能直接访问其他驱动（ISP 相机、视频解码器、GPU）分配的内存，全程零内存拷贝
+	1.用户态调用 DRM_IOCTL_PRIME_FD_TO_HANDLE ioctl，把 dma-buf fd 转换成 DRM GEM handle 时，DRM 框架最终会调用该函数；
+	2.典型业务场景：相机预览、视频解码画面上屏、GPU 渲染画面输出，实现跨驱动零拷贝；
+	3.它是上层 rockchip_drm_gem_prime_import 的底层实现，上层默认将 attach_dev 设为 DRM 设备本身。
+*/
 static struct drm_gem_object *rockchip_drm_gem_prime_import_dev(struct drm_device *dev,
 								struct dma_buf *dma_buf,
 								struct device *attach_dev)
@@ -1927,8 +2012,14 @@ static struct drm_gem_object *rockchip_drm_gem_prime_import_dev(struct drm_devic
 	int ret;
 
 	if (dma_buf->ops == &rockchip_drm_gem_prime_dmabuf_ops) {
+		/*
+			判断待导入的 dma-buf，是否是 Rockchip DRM 驱动自己导出的：只有 Rockchip 
+				驱动导出的 dma-buf，才会绑定你之前解析的专属 rockchip_drm_gem_prime_dmabuf_ops 方法集；
+			这是快速路径的准入条件，不满足则直接进入通用跨驱动导入流程。
+		*/
 		obj = dma_buf->priv;
 		if (obj->dev == dev) {
+			// 校验原始 GEM 对象是否属于当前的 DRM 设备，避免跨设备、跨芯片的非法导入，防止内核 Oops。
 			/*
 			 * Importing dmabuf exported from out own gem increases
 			 * refcount on gem itself instead of f_count of dmabuf.
@@ -1941,18 +2032,41 @@ static struct drm_gem_object *rockchip_drm_gem_prime_import_dev(struct drm_devic
 	if (!dev->driver->gem_prime_import_sg_table)
 		return ERR_PTR(-EINVAL);
 
+	/*
+		dma_buf_attach 是 Linux dma-buf 框架标准 API，核心作用是把要访问 buffer 的硬件设备（attach_dev）
+			与 dma-buf 进行绑定（附着），创建专属的 dma_buf_attachment 附着实例；
+		底层执行逻辑：
+		校验硬件设备的 DMA 寻址能力，确保设备能访问该 dma-buf 的物理内存；
+		调用 dma-buf ops 中的 .attach 回调（Rockchip 驱动对应 drm_gem_map_attach），完成设备相关的初始化；
+		返回附着实例，后续所有映射、同步操作都基于该实例执行；
+	*/
 	attach = dma_buf_attach(dma_buf, attach_dev);
 	if (IS_ERR(attach))
 		return ERR_CAST(attach);
 
 	get_dma_buf(dma_buf);
-
+	
+	/*
+		dma_buf_map_attachment 是 dma-buf 框架核心标准 API，作用是为附着的硬件设备，
+			生成可直接用于 DMA 传输的 sg_table 散列表，并完成 DMA 总线地址映射；
+		参数 DMA_BIDIRECTIONAL：指定数据传输方向为双向，既支持 CPU 写、外设读（显示场景），
+			也支持外设写、CPU 读（相机采集场景），适配全业务场景；
+		调用 dma-buf ops 中的 .map_dma_buf 回调，获取 buffer 对应的物理内存信息；
+		为 attach_dev 完成 DMA 地址映射，填充 sg_table 每个条目的 dma_address（外设可直接访问的总线地址 / IOVA 地址）；
+		执行 DMA 缓存同步，保证硬件能读到内存中的最新数据；
+	*/
 	sgt = dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL);
 	if (IS_ERR(sgt)) {
 		ret = PTR_ERR(sgt);
 		goto fail_detach;
 	}
 
+	/*
+		分配 rockchip_gem_object 定制结构体，初始化标准 DRM GEM 基类；
+		保存 sg_table 到 GEM 对象，从 sg_table 中提取物理页指针数组 pages；
+		开启 IOMMU 的场景下，自动完成 IOVA 虚拟地址映射，生成外设可访问的 dma_addr；
+		返回标准 drm_gem_object 基类指针；
+	*/
 	obj = dev->driver->gem_prime_import_sg_table(dev, attach, sgt);
 	if (IS_ERR(obj)) {
 		ret = PTR_ERR(obj);

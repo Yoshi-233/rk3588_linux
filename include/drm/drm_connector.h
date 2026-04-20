@@ -1769,7 +1769,7 @@ bool drm_connector_has_possible_encoder(struct drm_connector *connector,
  * @connector: &struct drm_connector pointer
  * @encoder: &struct drm_encoder pointer used as cursor
  */
-#define drm_connector_for_each_possible_encoder(connector, encoder) \
+#define 	drm_connector_for_each_possible_encoder(connector, encoder) \
 	drm_for_each_encoder_mask(encoder, (connector)->dev, \
 				  (connector)->possible_encoders)
 

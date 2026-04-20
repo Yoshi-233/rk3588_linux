@@ -75,6 +75,13 @@ int drm_atomic_set_mode_for_crtc(struct drm_crtc_state *state,
 	state->mode_blob = NULL;
 
 	if (mode) {
+		// 把内核私有专用的显示模式结构体，转换成DRM UAPI（用户态 - 内核态接口）标准的、跨场景兼容的时序数据格式；
+		/*
+			用户态读取 CRTC 显示模式的标准流程是：
+			通过GET_PROPERTY IOCTL 读取 CRTC 的MODE_ID属性，拿到 Blob ID；
+			通过GET_BLOB IOCTL 读取 Blob 的内容，拿到标准的struct drm_mode_modeinfo；
+			解析这个标准结构，获取当前的分辨率、刷新率等参数。
+		*/
 		drm_mode_convert_to_umode(&umode, mode);
 		state->mode_blob =
 			drm_property_create_blob(state->crtc->dev,

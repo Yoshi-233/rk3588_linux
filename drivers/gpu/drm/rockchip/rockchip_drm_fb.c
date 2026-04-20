@@ -65,12 +65,20 @@ static void rockchip_drm_fb_destroy(struct drm_framebuffer *fb)
 	if (is_rockchip_logo_fb(fb)) {
 		struct rockchip_drm_logo_fb *rockchip_logo_fb = to_rockchip_logo_fb(fb);
 
+		/* 
+			schedule_delayed_work(..., HZ)：不立即销毁 logo 帧缓冲，
+			而是延迟 1 秒（HZ为 Linux 内核时钟频率，1HZ 对应 1 秒）执行销毁工作。 
+		*/
 		schedule_delayed_work(&rockchip_logo_fb->destroy_work, HZ);
 	} else {
 		__rockchip_drm_fb_destroy(fb);
 	}
 }
 
+/*
+	DRM 框架调用时机：用户态进程通过DRM_IOCTL_MODE_GETFB2 ioctl，
+		请求获取帧缓冲对应的 GEM 对象句柄时，DRM 核心自动触发该回调。
+*/
 static int rockchip_drm_gem_fb_create_handle(struct drm_framebuffer *fb,
 					     struct drm_file *file,
 					     unsigned int *handle)
@@ -78,10 +86,31 @@ static int rockchip_drm_gem_fb_create_handle(struct drm_framebuffer *fb,
 	if (is_rockchip_logo_fb(fb))
 		return -EOPNOTSUPP;
 
+	/*
+		1.为当前用户态进程（struct drm_file *file），在其 DRM 文件上下文
+			的 IDR 基数树中，为帧缓冲绑定的 GEM 对象分配唯一的 32 位句柄；
+		2.递增 GEM 对象的引用计数，保证用户态持有句柄期间，GEM 对象和对应内存不会被释放；
+		3.将创建的句柄通过handle指针返回给用户态，供后续 mmap、PRIME 导出等操作使用。
+	*/
 	return drm_gem_fb_create_handle(fb, file, handle);
 }
 
+/*
+	struct drm_framebuffer_funcs 是 Linux DRM 内核框架强制要求为
+		每个帧缓冲（struct drm_framebuffer）绑定的标准操作回调集
+	对普通用户态创建的帧缓冲：完全遵循 DRM GEM 标准框架的默认行为；
+	LOGO 专用帧缓冲（标记了ROCKCHIP_DRM_MODE_LOGO_FB flag）：实现定制化的生命周期管控、
+		内存释放逻辑、用户态访问拦截，核心保障开机 logo 无缝显示的稳定性，避免用户态
+		操作或时序问题破坏内核态 logo 显示。
+*/
 static const struct drm_framebuffer_funcs rockchip_drm_fb_funcs = {
+	/*
+		DRM 框架调用时机：当帧缓冲的引用计数降为 0 时，DRM 核心自动触发该回调，
+			是帧缓冲生命周期的终点，负责完成所有资源释放、内存回收、框架状
+			态清理，避免内存泄漏和内核状态异常。
+		核心设计亮点：区分 logo 帧缓冲与普通帧缓冲，为 logo 帧缓冲实现延迟销毁
+			机制，这是瑞芯微开机 logo 无闪屏无缝切换的核心关键设计之一。
+	*/
 	.destroy       = rockchip_drm_fb_destroy,
 	.create_handle = rockchip_drm_gem_fb_create_handle,
 };

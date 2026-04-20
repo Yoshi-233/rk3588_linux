@@ -1826,26 +1826,82 @@ int drm_atomic_helper_commit(struct drm_device *dev,
 	int ret;
 
 	if (state->async_update) {
+		/*
+			只有当原子事务的async_update标志位被置位时，才走这个分支。
+			触发条件：本次提交仅修改 Plane 图层的帧缓冲 / 坐标，无任何 
+				CRTC/Connector 的模式变更、时序修改、开关操作，且
+				驱动实现了atomic_async_update回调。
+			开机 Logo 场景：绝对不会走这个分支，因为 Logo 是全量的显示
+				通路配置、时序设置、CRTC/Connector 使能，必须走标
+				准全量提交流程。
+
+			调用图层准备函数，为本次提交涉及的所有 Plane（图层）准备硬件资源。
+			内部核心动作（来自你提供的参考文档）：
+			准备回写任务（如果有）；
+			调用驱动实现的prepare_fb回调，为帧缓冲（FB）建立 IOMMU 映射、锁定内存、申请硬件资源；
+			任何一步失败，直接返回错误码，终止流程。
+			设计原因：先准备所有可能失败的资源，保证后续流程无失败点，符合原子提交「要么全成、要么全回滚」的原则。
+		*/
 		ret = drm_atomic_helper_prepare_planes(dev, state);
 		if (ret)
 			return ret;
 
+		/*
+			执行异步提交，直接、快速地把图层更新写入硬件寄存器，不走标准
+				的全量提交流程。
+			内部核心动作（来自参考文档）：
+			调用驱动实现的atomic_async_update回调，直接修改 Plane 的硬
+				件寄存器，更新帧缓冲地址 / 坐标；
+			原地更新 Plane 的当前生效状态，不做全量的状态 swap；
+			仅修改目标 Plane，不触碰 CRTC/Connector 的任何配置，保证极
+				致的更新速度。
+		*/
 		drm_atomic_helper_async_commit(dev, state);
+		/*
+			清理图层资源，调用驱动的cleanup_fb回调，释放prepare_planes阶段
+				申请的临时资源、解除多余的内存锁定。
+			异步提交完成后立即清理，避免资源泄漏。
+		*/
 		drm_atomic_helper_cleanup_planes(dev, state);
 
 		return 0;
 	}
 
+	/*
+		1.为本次提交涉及的每个 CRTC，分配并初始化struct drm_crtc_commit提交跟踪对象，包含 3 个核心完成量：
+		hw_done：硬件配置完成信号；
+		flip_done：画面翻转完成（VBlank）信号；
+		cleanup_done：资源清理完成信号；
+		2.执行stall_checks，防止非阻塞提交过快，避免硬件还没处理完上一帧就提交新帧，导致画面撕裂、硬件异常；
+		3.为本次提交绑定 vblank 事件，用于通知用户态画面翻转完成；
+		4.为 Connector/Plane 绑定对应的提交跟踪对象，建立完整的依赖关系。
+		5.任何初始化失败，直接返回错误码，终止流程，无任何状态修改
+	*/
 	ret = drm_atomic_helper_setup_commit(state, nonblock);
 	if (ret)
 		return ret;
 
+	/*
+		调用 Linux 内核标准宏，初始化原子事务内嵌的工作项commit_work，
+			绑定工作处理函数为commit_work。
+		核心作用：为非阻塞提交做准备，非阻塞提交时，会把真正的硬件提交
+			操作放到内核后台工作队列中异步执行，不阻塞当前线程。
+		工作项的处理函数commit_work，最终会调用commit_tail函数，执行
+			真正的硬件寄存器写入操作（来自参考文档）
+	*/
 	INIT_WORK(&state->commit_work, commit_work);
 
 	ret = drm_atomic_helper_prepare_planes(dev, state);
 	if (ret)
 		return ret;
 
+	/*
+		1.dma_fence是 Linux 内核 DMA / 图形子系统的同步机制，用于保证：GPU / 硬件对帧缓冲的渲染完成后，显示控制器才会去读取这个帧缓冲，避免画面撕裂、花屏。
+		2.遍历本次提交的所有 Plane，等待每个 Plane 的fence信号完成；
+		3.等待完成后，释放 fence 的引用计数，置空plane_state->fence；
+		4.入参pre_swap=true，代表这是状态 swap 之前的等待，使用可中断的等待方式，用户态可以通过信号中断等待。
+		5.等待失败，直接跳转到err错误处理分支，清理已申请的资源，完全回滚。
+	*/
 	if (!nonblock) {
 		ret = drm_atomic_helper_wait_for_fences(dev, state, true);
 		if (ret)
@@ -1857,7 +1913,15 @@ int drm_atomic_helper_commit(struct drm_device *dev,
 	 * when the hw goes bonghits. Which means we can commit the new state on
 	 * the software side now.
 	 */
-
+	/*
+		入参stall=true，先等待上一次提交的hw_done硬件完成信号，保证上一次提交完全结束，再切换状态，避免状态重叠、硬件混乱；
+		执行写时复制（COW）的最终状态切换：
+		把 CRTC/Connector/Plane/ 私有对象的当前生效状态，从旧状态切换为你构造的新状态；
+		把旧状态收回到state原子事务容器中，用于后续回滚、资源清理、状态跟踪；
+		更新每个状态对象的state指针，绑定到对应的事务容器；
+		把本次提交的跟踪对象，加入到 CRTC 的提交链表中；
+		切换失败，跳转到err错误处理分支，清理资源。
+	*/
 	ret = drm_atomic_helper_swap_state(state, true);
 	if (ret)
 		goto err;
@@ -1886,6 +1950,14 @@ int drm_atomic_helper_commit(struct drm_device *dev,
 	if (nonblock)
 		queue_work(system_unbound_wq, &state->commit_work);
 	else
+	/*
+		drm_atomic_helper_commit_modeset_disables：关闭需要变更的旧输出通路；
+		drm_atomic_helper_commit_planes：写入 Plane 图层寄存器，配置 Logo 帧缓冲地址；
+		drm_atomic_helper_commit_modeset_enables：使能 CRTC/Connector，写入时序寄存器，点亮屏幕；
+		drm_atomic_helper_commit_hw_done：标记硬件提交完成；
+		等待 VBlank 画面翻转完成；
+		drm_atomic_helper_cleanup_planes：清理图层资源；
+	*/
 		commit_tail(state);
 
 	return 0;
@@ -2762,6 +2834,11 @@ EXPORT_SYMBOL(drm_atomic_helper_cleanup_planes);
  *
  * Returns 0 on success. Can return -ERESTARTSYS when @stall is true and the
  * waiting for the previous commits has been interrupted.
+ * 把 “准备好的新状态” 真正刷入硬件对象（CRTC/Connector/Plane），
+同时把 “旧状态” 收回到 atomic_state 里保存，用于后续提交失败回滚。
+它是 原子提交中 “软件状态生效” 的唯一入口。
+stall:是否要等待上一次提交硬件彻底完成再切换
+→ 为了防止多次提交重叠、硬件状态混乱
  */
 int drm_atomic_helper_swap_state(struct drm_atomic_state *state,
 				  bool stall)
@@ -2824,10 +2901,13 @@ int drm_atomic_helper_swap_state(struct drm_atomic_state *state,
 	for_each_oldnew_connector_in_state(state, connector, old_conn_state, new_conn_state, i) {
 		WARN_ON(connector->state != old_conn_state);
 
+		// 旧状态绑定到本次事务，方便后续回滚、释放、清理
 		old_conn_state->state = state;
+		//  新状态不再绑定事务（已经准备生效）
 		new_conn_state->state = NULL;
-
+		// 事务保存旧状态
 		state->connectors[i].state = old_conn_state;
+		// 真正生效：把 connector->state 切换为新状态！
 		connector->state = new_conn_state;
 	}
 
@@ -2841,6 +2921,7 @@ int drm_atomic_helper_swap_state(struct drm_atomic_state *state,
 		crtc->state = new_crtc_state;
 
 		if (new_crtc_state->commit) {
+			// 把本次提交加入 CRTC 的提交队列，用于跟踪 flip_done /hw_done。
 			spin_lock(&crtc->commit_lock);
 			list_add(&new_crtc_state->commit->commit_entry,
 				 &crtc->commit_list);

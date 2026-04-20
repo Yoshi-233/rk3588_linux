@@ -939,6 +939,12 @@ EXPORT_SYMBOL(drm_atomic_get_new_connector_for_encoder);
  * Either the allocated state or the error code encoded into the pointer. When
  * the error is EDEADLK then the w/w mutex code has detected a deadlock and the
  * entire atomic sequence must be restarted. All other errors are fatal.
+ * 这是Linux DRM 原子模式设置框架的核心标准 API，是驱动在原子事务中修改显示接口
+ * （Connector，对应 HDMI/DP/MIPI/ 回写等物理输出端口）配置的唯一合法入口。
+ * 它的核心设计思想是写时复制（COW, Copy-On-Write）：绝对不允许直接修改当前硬件
+ * 正在生效的只读状态connector->state，而是通过该接口获取一个专属的可写状态副本，
+ * 所有修改都在副本上进行，最终通过drm_atomic_commit一次性原子生效到硬件，全程不
+ * 影响当前显示画面（实现无缝开机 Logo、无闪屏切换的核心保障）。
  */
 struct drm_connector_state *
 drm_atomic_get_connector_state(struct drm_atomic_state *state,
@@ -950,12 +956,23 @@ drm_atomic_get_connector_state(struct drm_atomic_state *state,
 
 	WARN_ON(!state->acquire_ctx);
 
+	// 核心作用：获取 DRM 设备全局的connection_mutex连接器互斥锁，保护所有 Connector 的状态变更、热插拔事件
 	ret = drm_modeset_lock(&config->connection_mutex, state->acquire_ctx);
 	if (ret)
 		return ERR_PTR(ret);
 
+	// 获取该 Connector 在 DRM 设备注册时分配的唯一固定索引，
+	// 用于在state->connectors数组中定位该 Connector 对应的状态条目。
 	index = drm_connector_index(connector);
 
+	/*
+		核心作用：原子事务的connectors数组是按需动态扩容的，不是默认分配全量大小，节省内核内存。
+		逻辑说明：
+		若当前数组大小不足以容纳目标 Connector 的索引，执行扩容；
+		扩容大小取index+1和设备总 Connector 数的最大值，保证数组不会越界；
+		krealloc重新分配内存，保留原有数组内容，分配失败返回-ENOMEM内存不足错误；
+		新扩容的区域清零，更新数组的总长度。
+	*/
 	if (index >= state->num_connector) {
 		struct __drm_connnectors_state *c;
 		int alloc = max(index + 1, config->num_connector);
@@ -978,17 +995,33 @@ drm_atomic_get_connector_state(struct drm_atomic_state *state,
 	if (!connector_state)
 		return ERR_PTR(-ENOMEM);
 
+	/*  
+		增加 Connector 的引用计数，保证该 Connector 在本次原子事务的生命周期内，
+			不会被热插拔、设备释放等操作销毁，避免内核use-after-free内存漏洞。
+	*/
 	drm_connector_get(connector);
 	state->connectors[index].state = connector_state;
 	state->connectors[index].old_state = connector->state;
 	state->connectors[index].new_state = connector_state;
 	state->connectors[index].ptr = connector;
+	/* 
+		把状态副本的state指针，绑定到本次全局原子事务，让 DRM 框架能追踪该状态所属
+			的事务，用于锁校验、生命周期管理（对应你之前代码里crtc->state->state 
+			= state的完全一致的逻辑） 
+	*/
 	connector_state->state = state;
 
 	DRM_DEBUG_ATOMIC("Added [CONNECTOR:%d:%s] %p state to %p\n",
 			 connector->base.id, connector->name,
 			 connector_state, state);
-
+	
+	/*
+		核心作用：如果该 Connector 当前已经绑定了一个 CRTC（也就是已经有显示输出），自动把对应的 CRTC 也纳入本次原子事务，获取 CRTC 的状态副本。
+		为什么必须这么写：Connector 和 CRTC 是显示链路的上下游，修改 Connector 
+			的状态必然会影响对应的 CRTC，必须把整个显示链路的所有硬件都纳入同
+			一个原子事务，保证状态变更的完整原子性，不会出现部分生效、部分不生
+			效的异常。
+	*/
 	if (connector_state->crtc) {
 		struct drm_crtc_state *crtc_state;
 

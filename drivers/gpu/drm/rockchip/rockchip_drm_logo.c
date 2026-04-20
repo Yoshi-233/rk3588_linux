@@ -376,7 +376,20 @@ static int init_loader_memory(struct drm_device *drm_dev)
 	logo = kmalloc(sizeof(*logo), GFP_KERNEL);
 	if (!logo)
 		return -ENOMEM;
-
+	
+	/*
+		适用前提（这段代码完全满足）
+		这段内存是通过设备树 reserved-memory 预留的常规物理内存，没有添加 no-map 属性（代码中后续对该内存做了 phys_to_page、free_reserved_page 等页操作，也反向证明了没有 no-map）；
+		预留内存的物理地址范围，在内核启动时建立的线性映射区（直接映射区） 覆盖范围内，内核会为这段物理内存建立固定的线性映射关系；
+		线性映射区的物理地址和虚拟地址，有固定的偏移量关系，phys_to_virt 本质就是通过这个固定偏移完成地址转换，效率极高。
+		转换后的地址用途
+		转换得到的 logo->kvaddr 是内核可以直接读写的逻辑地址，内核可以通过这个地址，直接访问 U-Boot 预加载到这段物理内存中的 logo 像素数据，无需再做 ioremap 映射。
+	
+		关键注意事项
+		如果你的设备树中，给这段 logo 预留内存添加了 no-map 属性，绝对不能使用 phys_to_virt：
+		no-map 会告诉内核：不要为这段物理内存建立线性映射，此时 phys_to_virt 转换得到的地址是非法的，访问会触发内核缺页异常；
+		这种场景下，必须使用 ioremap(start, size) 来建立动态映射，获得合法的内核虚拟地址。
+	*/
 	logo->kvaddr = phys_to_virt(start);
 
 	/*
@@ -645,29 +658,60 @@ of_parse_display_resource(struct drm_device *drm_dev, struct device_node *route)
 	return set;
 }
 
+/*
+	1.检测显示接口的连接状态（屏幕是否插入、是否强制输出）；
+	2.从显示器 EDID、驱动兜底、厂商自定义三个维度，收集该接口支持的所有显示模式；
+	3.对所有模式做多层合法性校验，过滤掉硬件不支持的无效模式；
+	4.最终输出排序后的有效模式链表，供后续和 U-Boot 传递的开机时序做精准匹配，保证
+		显示硬件不重置、画面不闪屏不黑屏。
+*/
 static int rockchip_drm_fill_connector_modes(struct drm_connector *connector,
 					     uint32_t maxX, uint32_t maxY,
 					     bool force_output)
 {
 	struct drm_device *dev = connector->dev;
 	struct drm_display_mode *mode;
+	/*
+		拿到该显示接口驱动实现的辅助函数集（如get_modes读 EDID、mode_valid模式校验、best_encoder选编码器等），
+			后续模式收集、校验都会调用这些厂商实现的回调。
+	*/
 	const struct drm_connector_helper_funcs *connector_funcs =
 		connector->helper_private;
 	int count = 0;
 	bool verbose_prune = true;
 	enum drm_connector_status old_status;
 
+	/*
+		这是 DRM 内核框架的强制规范：该函数会修改connector->modes模式链表，
+			属于全局共享资源，必须在持有mode_config.mutex全局模式锁的上下文调用。
+		对应你之前rockchip_drm_show_logo里的drm_modeset_lock_all(drm_dev)
+			，调用前已经持有了全局锁，完全符合规范。
+	*/
 	WARN_ON(!mutex_is_locked(&dev->mode_config.mutex));
 
 	DRM_DEBUG_KMS("[CONNECTOR:%d:%s]\n", connector->base.id,
 		      connector->name);
 	/* set all modes to the unverified state */
+	/*
+		旧模式标记过期：遍历connector->modes链表，把所有旧模式的status
+			设为MODE_STALE（过期状态）。
+		设计原因：本次要重新探测、收集全新的模式，旧的模式数据全部作废，
+			避免脏数据影响本次探测结果，保证模式链表的纯净性。
+	*/
 	list_for_each_entry(mode, &connector->modes, head)
 		mode->status = MODE_STALE;
 
 	if (force_output)
 		connector->force = DRM_FORCE_ON;
 	if (connector->force) {
+		/*
+			强制设置connector->force = DRM_FORCE_ON，告诉 DRM 框架：
+				不管硬件有没有检测到屏幕，都强制认为接口已连接；
+			直接把connector->status设为connector_status_connected
+				（已连接），跳过硬件 HPD 热插拔检测；
+			如果驱动实现了force回调，调用该回调执行硬件强制输出的配置
+				（比如强制开启 HDMI PHY、DP 链路训练）。
+		*/
 		if (connector->force == DRM_FORCE_ON ||
 		    connector->force == DRM_FORCE_ON_DIGITAL)
 			connector->status = connector_status_connected;
@@ -676,6 +720,15 @@ static int rockchip_drm_fill_connector_modes(struct drm_connector *connector,
 		if (connector->funcs->force)
 			connector->funcs->force(connector);
 	} else {
+		/*
+			1.保存检测前的旧状态old_status；
+			2.调用驱动实现的detect回调，执行硬件 HPD 检测（比如 HDMI 的热插拔引脚
+				检测、DP 的热插拔事件），更新connector->status；
+			3.如果驱动没实现detect回调，默认认为接口已连接；
+			4.热插拔事件处理：如果检测前后状态发生变化（比如屏幕刚插入 / 拔出），不
+				能直接在锁上下文处理热插拔事件（会导致死锁），因此调度output_poll_work
+				工作队列，异步处理热插拔事件，符合 DRM 框架的锁规范。
+		*/
 		old_status = connector->status;
 
 		if (connector->funcs->detect)
@@ -721,11 +774,29 @@ static int rockchip_drm_fill_connector_modes(struct drm_connector *connector,
 		goto prune;
 	}
 
+	/*
+		非强制输出场景下，调用驱动实现的get_modes回调，读取显示器的 EDID 数据，
+			解析出显示器原生支持的所有显示模式（分辨率、刷新率、时序等），
+			返回解析到的模式数量count。
+		这是最优先的模式来源，因为 EDID 里的模式是显示器官方支持的，兼容性最好
+	*/
 	if (!force_output)
 		count = (*connector_funcs->get_modes)(connector);
 
+	/*
+		如果 EDID 读取失败（count=0），但接口已连接，调用drm_add_modes_noedid生
+			成 DRM 框架通用的 VESA 标准模式（如 1080p@60、720p@60 等），最
+			大支持 4096x4096 分辨率，保证即使读不到 EDID，也有基础模式可用。
+	*/
 	if (count == 0 && connector->status == connector_status_connected)
 		count = drm_add_modes_noedid(connector, 4096, 4096);
+
+	/*
+		强制输出场景下，额外调用rockchip_drm_add_modes_noedid，添加 Rockchip 厂
+			商自定义的显示模式（适配 Rockchip VOP 显示控制器的时序要求，和 
+			U-Boot 的输出时序完全对齐），保证强制输出时能和 U-Boot 的开机模式
+			精准匹配。
+	*/
 	if (force_output)
 		count += rockchip_drm_add_modes_noedid(connector);
 	if (count == 0)
@@ -734,9 +805,11 @@ static int rockchip_drm_fill_connector_modes(struct drm_connector *connector,
 	drm_connector_list_update(connector);
 
 	list_for_each_entry(mode, &connector->modes, head) {
+
+		// 驱动全局合法性校验，检查模式的时钟、时序是否超出 DRM 设备的全局限制
 		if (mode->status == MODE_OK)
 			mode->status = drm_mode_validate_driver(dev, mode);
-
+		// 分辨率尺寸校验，过滤掉宽高超过maxX/maxY的模式
 		if (mode->status == MODE_OK)
 			mode->status = drm_mode_validate_size(mode, maxX, maxY);
 
@@ -744,25 +817,35 @@ static int rockchip_drm_fill_connector_modes(struct drm_connector *connector,
 		 * if (mode->status == MODE_OK)
 		 *	mode->status = drm_mode_validate_flag(mode, mode_flags);
 		 */
+		// 厂商接口专属校验，调用显示接口驱动实现的mode_valid回调
 		if (mode->status == MODE_OK && connector_funcs->mode_valid)
 			mode->status = connector_funcs->mode_valid(connector,
-								   mode);
+		// YCbCr420 格式校验，检查模式是否支持 YCbCr420 亚采样输出					   mode);
 		if (mode->status == MODE_OK)
 			mode->status = drm_mode_validate_ycbcr420(mode,
 								  connector);
 	}
 
 prune:
+	// drm_mode_prune_invalid遍历模式链表，把所有非MODE_OK的模式从链表中删除、释放内存，只保留有效模式。
 	drm_mode_prune_invalid(dev, &connector->modes, verbose_prune);
 
 	if (list_empty(&connector->modes))
 		return 0;
 
+	/*
+		drm_mode_sort对有效模式按 DRM 框架的优先级规则排序：
+		优先按刷新率从高到低排序；
+		同刷新率下，按分辨率从高到低排序；
+		显示器原生模式优先于兜底模式；
+		排序后，最优的模式放在链表最前面，方便后续和 U-Boot 的时序匹配。
+	*/
 	drm_mode_sort(&connector->modes);
 
 	DRM_DEBUG_KMS("[CONNECTOR:%d:%s] probed modes :\n", connector->base.id,
 		      connector->name);
 	list_for_each_entry(mode, &connector->modes, head) {
+		// drm_mode_set_crtcinfo给每个模式填充 CRTC 相关的时序信息，处理隔行扫描模式，为后续 CRTC 配置做准备；
 		drm_mode_set_crtcinfo(mode, CRTC_INTERLACE_HALVE_V);
 		drm_mode_debug_printmodeline(mode);
 	}
@@ -773,12 +856,20 @@ prune:
 /*
  * For connectors that support multiple encoders, either the
  * .atomic_best_encoder() or .best_encoder() operation must be implemented.
+ * 这是Rockchip DRM 显示驱动专为「Connector-Encoder 一对一硬件绑定」场景设计的极
+ * 简工具函数，核心作用是：快速获取与当前显示接口（Connector，对应 HDMI/DP/MIPI 等
+ * 物理屏幕接口）唯一绑定的编码器（Encoder，负责把 CRTC/VOP 的像素数据转换成对应接
+ * 口的物理信号）
  */
 static struct drm_encoder *
 rockchip_drm_connector_get_single_encoder(struct drm_connector *connector)
 {
 	struct drm_encoder *encoder;
 
+	/*
+		Linux 内核标准工具函数，作用是计算 32 位整数中置 1 的 bit 位数量（汉明重量）
+		，也就是统计这个 Connector 支持的编码器总数。
+	*/
 	WARN_ON(hweight32(connector->possible_encoders) > 1);
 	drm_connector_for_each_possible_encoder(connector, encoder)
 		return encoder;
@@ -815,9 +906,33 @@ static int setup_initial_state(struct drm_device *drm_dev,
 			确保状态变更关联到本次事务。
 		drm_atomic_get_connector_state：从原子状态对象中获取 Connector 的状态对象 conn_state，
 			后续对 Connector 的配置（如绑定 Encoder、设置亮度）都写入该对象。
+	
+		DRM 原子框架强制要求：每个硬件模块的状态对象（drm_crtc_state/drm_connector_state等），
+			必须通过state指针，关联到它所属的全局原子事务容器。框架会通过这个指针做锁合法性
+			校验、死锁检测、状态生命周期管理。
+		正常的原子操作流程中，这个绑定动作会由drm_atomic_get_crtc_state()自动完成；但 Rockchip
+			 这里是无缝开机 Logo 的特殊场景：需要完全继承 U-Boot 已经设置好的硬件状态，不能
+			 从零开始配置，因此提前手动完成绑定，保证后续获取 Connector 状态时，框架能正确校
+			 验事务合法性，避免触发内核WARN_ON警告。	
 	*/
 	crtc->state->state = state;
 
+	/*
+		从本次原子事务的全局容器中，获取指定显示接口（Connector，对应 HDMI/DP/MIPI 等物理屏幕接口）
+			的可写状态副本，赋值给conn_state变量。
+		DRM 原子框架的核心设计是写时复制（COW）机制：connector->state是当前硬件正在生效的只读状态，
+			驱动绝对不能直接修改，否则会导致内核软件状态与硬件状态不一致，触发竞态、花屏、甚至内
+			核 Oops。
+		这个函数是 DRM 框架提供的、获取 Connector 可修改状态的唯一入口：它会自动完成状态副本的复制、
+			事务绑定、锁校验，保证所有对 Connector 的修改，都在本次事务的专属副本上进行，最终通
+			过原子提交一次性生效，全程不会影响当前正在显示的画面（实现无缝 Logo 不闪屏）。
+		Rockchip 后续对显示接口的所有配置（绑定编码器、设置亮度 / 对比度 / 饱和度、绑定 CRTC 显示通路）
+			，都必须在这个返回的conn_state副本上修改，不能直接操作connector->state。	
+	
+		参数		说明							合法性要求
+		state		本次原子提交事务的全局状态容器				必须是已初始化、绑定了锁上下文acquire_ctx的有效对象，不能为 NULL
+		connector	目标显示接口对象（对应 HDMI/DP/MIPI 等物理接口）	必须是已向 DRM 核心完成注册的合法对象，不能为 NULL
+	*/
 	conn_state = drm_atomic_get_connector_state(state, connector);
 	if (IS_ERR(conn_state))
 		return PTR_ERR(conn_state);
@@ -929,15 +1044,49 @@ static int setup_initial_state(struct drm_device *drm_dev,
 		goto error_conn;
 	}
 
+	/*
+		1.mode：前面通过rockchip_drm_fill_connector_modes探测、并和 
+			U-Boot 传递到设备树的开机时序做了全字段匹配的显示模式，
+			包含像素时钟、分辨率、同步时序、刷新率等所有硬件生效的显示参数。
+		2.crtc_state->adjusted_mode：CRTC 最终输出给硬件的实际生效时序，是经
+			过驱动修正后的最终寄存器配置依据，DRM 框架会用这个值配置 VOP 硬
+			件的时序寄存器。
+	*/
 	drm_mode_copy(&crtc_state->adjusted_mode, mode);
+	// 屏幕 EDID 读取失败、U-Boot 与 Kernel 的时序配置不一致、设备树参数错误
+	// 设备树显示路由配置错误、U-Boot 没有传递开机时序参数
 	if (!match || !is_crtc_enabled) {
+		// 标记为模式变更，告诉后续的update_state函数，需要走标准的 DRM 全量硬件配置流程，重新设置 CRTC/Encoder/Connector 的时序。
 		set->mode_changed = true;
 	} else {
+		// 进入这个分支的唯一前提：找到了和 U-Boot 开机时序 100% 匹配的模式，
+		//且 CRTC 已使能，这是实现无闪屏无缝开机的核心分支，目标是完全继承 
+		// U-Boot 的硬件状态，不重置任何硬件模块。
+		/*
+			把conn_state->crtc设置为目标 CRTC，告诉 DRM 框架：
+				这个显示接口要用这个 VOP 输出画面数据；
+			自动更新 CRTC 状态的connector_mask掩码，标记该 CRTC 
+				绑定了哪些显示接口；
+			做硬件合法性校验：检查 CRTC 是否支持该 Connector、
+				是否有硬件资源冲突，校验失败返回对应错误码。
+		*/
 		ret = drm_atomic_set_crtc_for_connector(conn_state, crtc);
 		if (ret)
 			goto error_conn;
 
+		/*
+			picture_aspect_ratio是 HDMI/DP 协议规定的画面宽高比参数
+				（如 4:3、16:9），设置为HDMI_PICTURE_ASPECT_NONE，
+				会告诉显示接口驱动，不要自动调整宽高比，避免开机 Logo
+				 画面拉伸、变形，保证和 U-Boot 显示的画面完全一致。
+		*/
 		mode->picture_aspect_ratio = HDMI_PICTURE_ASPECT_NONE;
+		/*
+			把mode完整复制到crtc_state->mode，这是 CRTC 的目标显示模式；
+			调用 CRTC 驱动的atomic_check回调，校验该模式是否被 VOP 硬件支持（比如像素时钟是否超出 VOP 最大范围、时序是否合法）；
+			校验通过后，更新crtc_state->enable为true，标记 CRTC 需要使能；
+			校验失败返回对应的错误码。
+		*/
 		ret = drm_atomic_set_mode_for_crtc(crtc_state, mode);
 		if (ret)
 			goto error_conn;
@@ -1212,16 +1361,79 @@ void rockchip_drm_show_logo(struct drm_device *drm_dev)
 
 	INIT_LIST_HEAD(&mode_set_list);
 	INIT_LIST_HEAD(&mode_unset_list);
+
+	/*
+		获取 DRM 设备所有硬件模块的模式设置锁；
+		初始化一个全局的锁事务上下文，并将其赋值给mode_config->acquire_ctx；
+		保证整个 logo 配置流程全程持有锁，避免其他内核线程（热插拔、console 切换）中途修改硬件状态，破坏 U-Boot 的显示配置。
+	*/
 	drm_modeset_lock_all(drm_dev);
-	/* 申请 DRM 原子状态对象，这是 DRM 原子模式设置的核心 
-	—— 所有硬件配置修改都先写入这个状态对象，验证无误后一次性提交给硬件，避免中途修改导致的屏幕异常 */
+	/* 
+		申请 DRM 原子状态对象，这是 DRM 原子模式设置的核心 
+			—— 所有硬件配置修改都先写入这个状态对象，验证无误后一次性提交给硬件，避免中途修改导致的屏幕异常 
+		该结构体的核心关键字段包括：
+			绑定当前 DRM 设备drm_dev的指针；
+			存储 CRTC（显示控制器 VOP）、Plane（图层）、Connector（显示接口）、Encoder（编码器）等所有硬件模块的「新旧状态」指针数组；
+			acquire_ctx：锁事务获取上下文（即第二行代码赋值的对象）；
+			引用计数、状态同步、错误回滚相关的管理字段。
+		函数内部执行逻辑（基于 Linux 5.10+ 瑞芯微常用内核版本）
+			内存分配：用kzalloc分配struct drm_atomic_state结构体内存，初始化为全 0，避免脏数据；
+			基础初始化：绑定传入的drm_dev，初始化引用计数为 1，初始化状态数组、链表、自旋锁等核心成员；
+			厂商扩展适配：调用驱动注册的atomic_state_alloc回调（瑞芯微 DRM 驱动用于分配私有状态，如 VOP 过扫描、BCSH 色彩参数、Cubic LUT 等扩展配置）；
+			返回结果：成功返回初始化完成的状态对象，失败返回NULL。
+			
+		1.严格遵循引用计数规则
+			函数返回的state初始引用计数为 1，使用完必须调用drm_atomic_state_put()释放
+			，否则会造成内存泄漏。特别注意：调用drm_atomic_helper_swap_state()后，状态
+			对象会和 DRM 设备全局状态交换，必须在交换后释放旧状态，严禁提前释放导致 UAF
+			（释放后使用）内核 Oops。
+		2.调用上下文限制
+			该函数只能在进程上下文调用，严禁在中断上下文（ISR）、软中断上下文使用，因为内
+			部使用GFP_KERNEL分配内存，可能会睡眠。
+		3.错误处理必须释放锁
+			分配失败必须跳转到解锁分支，绝对不能直接 return，否则会导致 DRM 全局锁无法释放
+			，整个显示子系统死锁。
+		4.单事务单对象原则
+			每个原子提交事务必须使用独立的drm_atomic_state对象，严禁多个事务共用同一个状态
+			对象，否则会导致状态混乱、硬件配置错误。
+	*/
 	state = drm_atomic_state_alloc(drm_dev);
 	if (!state) {
+		/*
+			核心目的：必须释放此前已持有的drm_modeset_lock_all
+				全局模式设置锁，否则会导致 DRM 子系统死锁，整个显示框架挂死。
+		*/
 		dev_err(drm_dev->dev, "failed to alloc atomic state for logo display\n");
 		ret = -ENOMEM;
 		goto err_unlock;
 	}
 
+	/*
+		DRM 框架中，每个 CRTC、Plane、Connector 都有独立的drm_modeset_lock（模式设置互斥锁）
+			，用于保护硬件状态的并发访问。原子提交时需要一次性获取所有相关硬件的锁，这个过
+			程由 **struct drm_modeset_acquire_ctx（锁获取上下文）** 统一管理，它是锁事
+			务的管理器，负责：
+		1.锁的有序获取与释放；
+		2.死锁检测与规避；
+		3.锁事务的生命周期管控。
+
+		这是 DRM 原子框架的强制规范要求，缺少这行代码会直接导致后续配置触发内核 WARN、报错甚至崩溃
+		1.锁合法性校验绑定
+			后续对显示状态的所有修改操作（drm_atomic_get_crtc_state/drm_atomic_get_connector_state/
+				drm_atomic_get_plane_state等），都会通过state->acquire_ctx检查当前是否持有对应硬
+				件的锁。如果未绑定上下文，框架会判定为「无锁非法访问」，直接触发WARN_ON并返回错误。
+		2.死锁检测与事务一致性
+			绑定全局锁上下文后，原子框架会通过该上下文统一管理所有锁的获取顺序，在多显示通路（如 HDMI+DP 
+				双屏 logo）配置时，自动做死锁检测，避免锁竞争导致的内核死锁。同时保证整个 logo 配置
+				的全流程，都在同一个锁事务内完成，不会被打断。
+		3.无缝显示的状态安全保障
+			开机 logo 的核心需求是继承 U-Boot 的硬件状态，不重置时钟 / PHY / 电源域。绑定锁上下文
+				后，全程持有全局锁，彻底避免其他内核模块中途修改硬件状态，保证 U-Boot 的显示配置
+				不被破坏，最终实现无闪屏无缝衔接。
+
+		调用drm_atomic_helper_swap_state()后，state中的acquire_ctx会被清空失效，严禁再对该state做任何
+			配置修改，必须直接释放。
+	*/
 	state->acquire_ctx = mode_config->acquire_ctx;
 
 	// 遍历route根节点下的所有子节点，每个子节点对应一个屏幕的显示通路（如 HDMI0、MIPI-DSI0）。
@@ -1261,8 +1473,9 @@ void rockchip_drm_show_logo(struct drm_device *drm_dev)
 	 * isn't used, we should close it.
 	 */
 	/*
-		这段代码的作用是清理无效显示通路，关闭未使用的 CRTC（VOP）硬件，
-		避免闲置硬件占用时钟、功耗，同时保护 uboot 的硬件状态。
+		1. 清理设备树中配置了、但初始化失败的无效显示通路（如屏幕未插、时序不匹配、EDID 读取失败的通路）；
+		2. 安全关闭未被有效 Logo 通路占用的闲置 CRTC（对应 RK 芯片的 VOP 显示控制器），避免闲置硬件占用时钟、功耗资源；
+		3. 全程严格遵循loader_protect无缝开机规则，关闭闲置硬件时绝对不破坏 U-Boot 已点亮的有效显示通路，杜绝闪屏、黑屏。
 	*/
 	list_for_each_entry_safe(unset, tmp, &mode_unset_list, head) {
 		struct rockchip_drm_mode_set *tmp_set;
@@ -1288,11 +1501,19 @@ void rockchip_drm_show_logo(struct drm_device *drm_dev)
 			 * written in uboot. If the mode_set is added into mode_unset_list, it
 			 * should be converted to crtc_state->adjusted_mode, in order to check
 			 * splice_mode flag in loader_protect().
+			 * 如果连分辨率都没有，说明这个通路的配置完全无效，U-Boot 也没有点亮这个通路，不需要执行loader_protect保护，直接跳过即可。
 			 */
 			if (unset->hdisplay && unset->vdisplay) {
 				// 获取 CRTC 的原子状态，把设备树中的显示时序写入adjusted_mode
 				crtc_state = drm_atomic_get_crtc_state(state, crtc);
 				// 锁定 CRTC 的硬件状态，关闭过程中不重置 uboot 设置的时钟、电源域，避免闪屏；
+				/*
+					adjusted_mode是 CRTC 最终输出给硬件的实际生效时序，loader_protect回调
+						会通过这个时序判断当前是否为 U-Boot 无缝拼接模式。只有把 U-Boot
+						 的时序写入adjusted_mode，loader_protect才能正确识别，保证关闭 
+						 CRTC 的过程中，不会重置全局 VIO 时钟、电源域，避免影响正在显示的
+						 有效 Logo 通路，杜绝闪屏。
+				*/
 				if (crtc_state)
 					rockchip_drm_copy_mode_from_mode_set(&crtc_state->adjusted_mode,
 									     unset);
